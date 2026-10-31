@@ -362,6 +362,12 @@ if (SD_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
+# BRANCUSI: build the bsd_* library and brancusi-engine (see brancusi/README.md).
+option(SD_BUILD_BRANCUSI "sd: build brancusi-engine" ON)
+if (SD_BUILD_BRANCUSI)
+    add_subdirectory(brancusi)
+endif()
+
 
 
 #
