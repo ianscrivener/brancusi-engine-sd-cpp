@@ -24,21 +24,22 @@ jobs:
           - variant: darwin-arm64-metal
             os: macos-15
             cmake: -DSD_METAL=ON
-          - variant: linux-x64-vulkan
-            os: ubuntu-24.04
-            cmake: -DSD_VULKAN=ON
-          - variant: linux-x64-cpu
-            os: ubuntu-24.04
-            cmake: ""
-          - variant: win-x64-vulkan
-            os: windows-2022
-            cmake: -DSD_VULKAN=ON
-          - variant: win-x64-cuda12
-            os: windows-2022
-            cmake: -DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
-          - variant: win-x64-cpu
-            os: windows-2022
-            cmake: ""
+          # Only Metal for now, to make CI faster. Remove the # to build the other variants.
+          # - variant: linux-x64-vulkan
+          #   os: ubuntu-24.04
+          #   cmake: -DSD_VULKAN=ON
+          # - variant: linux-x64-cpu
+          #   os: ubuntu-24.04
+          #   cmake: ""
+          # - variant: win-x64-vulkan
+          #   os: windows-2022
+          #   cmake: -DSD_VULKAN=ON
+          # - variant: win-x64-cuda12
+          #   os: windows-2022
+          #   cmake: -DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
+          # - variant: win-x64-cpu
+          #   os: windows-2022
+          #   cmake: ""
     runs-on: ${{ matrix.os }}
     defaults:
       run:
