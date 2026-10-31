@@ -103,7 +103,8 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Manifest
-        run: jq -s 'map({(.variant): {file, size, sha256}}) | add' dist/*.json > dist/manifest.json
+        run: |
+          jq -s 'map({(.variant): {file, size, sha256}}) | add' dist/*.json > dist/manifest.json
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
