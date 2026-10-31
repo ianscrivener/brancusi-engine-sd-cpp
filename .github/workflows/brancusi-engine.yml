@@ -25,10 +25,10 @@ jobs:
             os: macos-15
             cmake: -DSD_METAL=ON
           - variant: linux-x64-vulkan
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             cmake: -DSD_VULKAN=ON
           - variant: linux-x64-cpu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             cmake: ""
           - variant: win-x64-vulkan
             os: windows-2022
@@ -51,25 +51,31 @@ jobs:
 
       - name: Vulkan SDK (Linux)
         if: contains(matrix.variant, 'vulkan') && runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc spirv-headers
 
       - name: Vulkan SDK (Windows)
         if: contains(matrix.variant, 'vulkan') && runner.os == 'Windows'
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: 1.4.309.0
-          cache: true
+        # Same installer as upstream build.yml. It includes glslc and SPIRV-Headers.
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.328.1
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
 
       - name: CUDA toolkit
         if: contains(matrix.variant, 'cuda')
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: "12.8.1"
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_BRANCUSI=ON ${{ matrix.cmake }}
+        # GGML_NATIVE=OFF: do not tune the build to the CPU of the CI runner.
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DSD_BUILD_BRANCUSI=ON ${{ matrix.cmake }}
 
       - name: Build
         run: cmake --build build --config Release -j 4 --target brancusi-engine bsd-tests
