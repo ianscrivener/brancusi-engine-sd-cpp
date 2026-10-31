@@ -138,6 +138,8 @@ typedef struct {
     const char* sigmas;       /* Comma-separated list or a preset name. NULL: none. */
     int32_t batch_count;      /* 0 or less: 1. */
     float flow_shift;         /* 0: model default. */
+    const char* preview_mode; /* "proj", "tae" or "vae". NULL or "none": no previews. */
+    int32_t preview_interval; /* Preview every N steps. 0 or less: 2. */
 } bsd_image_params_t;
 
 typedef struct {
@@ -166,8 +168,11 @@ typedef struct {
     /* BSD_EVENT_PREVIEW */
     const bsd_image_t* preview;
     int32_t is_noisy;
-    /* BSD_EVENT_STAGE: "load", "generate", ... */
+    /* BSD_EVENT_STAGE: "load", "encode_prompt", "sample", "decode" */
     const char* stage;
+    /* BSD_EVENT_METRICS: a finished stage and its duration. */
+    const char* timing_name;
+    float timing_ms;
 } bsd_event_t;
 
 typedef void (*bsd_event_cb_t)(const bsd_event_t* event, void* user);
@@ -226,6 +231,12 @@ void bsd_set_event_cb(bsd_engine_t* e, bsd_event_cb_t cb, void* user);
 const char* bsd_component_name(bsd_component_t c);
 /* Map recent upstream log text to a status. Used when upstream gives no other signal. */
 bsd_status_t bsd_classify_failure(const char* log_text);
+/*
+ * Layer 1 stage detection from one upstream log line. Sets *stage when a stage starts.
+ * Sets *timing_name and *timing_ms when a stage ends. Returns 1 if the line matched.
+ * Layer 2 replaces this with direct state (see the Layer 2 register).
+ */
+int bsd_detect_stage(const char* line, const char** stage, const char** timing_name, float* timing_ms);
 
 #ifdef __cplusplus
 }

@@ -127,9 +127,37 @@ void on_sd_log(sd_log_level_t level, const char* text, void*) {
             e->recent_log.pop_front();
         }
     }
+    const char* stage       = nullptr;
+    const char* timing_name = nullptr;
+    float timing_ms         = 0;
+    if (bsd_detect_stage(line.c_str(), &stage, &timing_name, &timing_ms)) {
+        if (stage != nullptr) {
+            emit_stage(e, stage);
+        }
+        if (timing_name != nullptr) {
+            bsd_event_t ev  = make_event(BSD_EVENT_METRICS);
+            ev.timing_name  = timing_name;
+            ev.timing_ms    = timing_ms;
+            emit(e, ev);
+        }
+    }
     bsd_event_t ev = make_event(BSD_EVENT_LOG);
     ev.level       = static_cast<bsd_log_level_t>(level);
     ev.text        = line.c_str();
+    emit(e, ev);
+}
+
+void on_sd_preview(int step, int frame_count, sd_image_t* frames, bool is_noisy, void*) {
+    bsd_engine* e = g_engine;
+    if (e == nullptr || frames == nullptr || frame_count <= 0 || frames[0].data == nullptr) {
+        return;
+    }
+    bsd_image_t image{frames[0].width, frames[0].height, frames[0].channel, frames[0].data};
+    bsd_event_t ev = make_event(BSD_EVENT_PREVIEW);
+    ev.step        = step;
+    ev.steps       = sd_get_preview_info().total_steps;
+    ev.preview     = &image;
+    ev.is_noisy    = is_noisy ? 1 : 0;
     emit(e, ev);
 }
 
@@ -265,6 +293,52 @@ bsd_status_t bsd_classify_failure(const char* log_text) {
         return BSD_ERR_BAD_MODEL;
     }
     return BSD_ERR_INTERNAL;
+}
+
+int bsd_detect_stage(const char* line, const char** stage, const char** timing_name, float* timing_ms) {
+    if (line == nullptr || stage == nullptr || timing_name == nullptr || timing_ms == nullptr) {
+        return 0;
+    }
+    *stage       = nullptr;
+    *timing_name = nullptr;
+    *timing_ms   = 0;
+    const std::string s(line);
+    auto taking = [&](const char* name) {
+        const size_t at = s.find("taking ");
+        if (at == std::string::npos) {
+            return false;
+        }
+        *timing_name = name;
+        *timing_ms   = std::strtof(s.c_str() + at + 7, nullptr) * 1000.0f;
+        return true;
+    };
+    struct Rule {
+        const char* prefix;
+        const char* stage;   // Stage that starts.
+        const char* timing;  // Stage that ends ("taking Ns").
+    };
+    // The first matching prefix wins.
+    static const Rule rules[] = {
+        {"generate_image completed", nullptr, nullptr},
+        {"generate_image ", "encode_prompt", nullptr},
+        {"get_learned_condition completed", nullptr, "encode_prompt"},
+        {"generating image: ", "sample", nullptr},
+        {"sampling completed", nullptr, "sample"},
+        {"decoding ", "decode", nullptr},
+        {"decode_first_stage completed", nullptr, "decode"},
+        {"loading tensors completed", nullptr, "load"},
+    };
+    for (const auto& rule : rules) {
+        if (s.rfind(rule.prefix, 0) != 0) {
+            continue;
+        }
+        *stage = rule.stage;
+        if (rule.timing != nullptr) {
+            taking(rule.timing);
+        }
+        return 1;
+    }
+    return 0;
 }
 
 bsd_engine_t* bsd_create(const bsd_config_t* config) {
@@ -559,11 +633,20 @@ bsd_status_t bsd_generate_image(bsd_engine_t* e, const bsd_image_params_t* p, bs
     }
     g.seed = seed;
 
+    preview_t preview = PREVIEW_NONE;
+    if (is_set(p->preview_mode) && std::strcmp(p->preview_mode, "none") != 0) {
+        preview = str_to_preview(p->preview_mode);
+        if (preview == PREVIEW_COUNT) {
+            return fail(e, BSD_ERR_INVALID_ARGUMENT, std::string("Unknown preview mode: ") + p->preview_mode);
+        }
+    }
+    sd_set_preview_callback(preview == PREVIEW_NONE ? nullptr : on_sd_preview, preview,
+                            p->preview_interval > 0 ? p->preview_interval : 2, true, false, nullptr);
+
     clear_recent_log(e);
     e->cancel_requested = false;
     sd_cancel_generation(e->ctx, SD_CANCEL_RESET);
     e->generating = true;
-    emit_stage(e, "generate");
 
     sd_image_generation_result_t* res = nullptr;
     const bool ok                     = generate_image(e->ctx, &g, &res);

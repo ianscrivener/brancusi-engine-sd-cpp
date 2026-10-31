@@ -13,6 +13,7 @@ Pinned upstream release: `master-1028-37bc88b`.
 | `src/l2_*.cpp` | Layer 2. Uses upstream internals. None yet. |
 | `host/main.cpp` | `brancusi-engine`. JSON lines on stdin and stdout. |
 | `tests/test_bsd.cpp` | Unit tests. They need no model. |
+| `scripts/package.sh` | Makes the zip for one variant. Prints its size and SHA-256. |
 
 ## Upstream hooks
 
@@ -44,7 +45,7 @@ Commands (core to engine):
 | `memory` | – | `memory` with `devices` |
 | `load` | `components` (part name to path), `options` | `stage`, `log`, then `loaded` or `error` |
 | `unload` | – | `unloaded` or `error` |
-| `generate` | `job`, `params`, `output_dir` | `stage`, `progress`, `log`, then `done` or `error` |
+| `generate` | `job`, `params`, `output_dir`, `preview` | `stage`, `progress`, `preview`, `metrics`, `log`, then `done` or `error` |
 | `cancel` | `job`, `mode` (`all` or `new_latents`) | `ok`. The running job then ends with `error` code `cancelled`. |
 | `log_level` | `level` (`debug`, `verbose`, `info`, `warn`, `error`) | `ok` |
 | `shutdown` | – | The engine stops the running job and exits. |
@@ -54,6 +55,15 @@ Part names are the `bsd_component_t` names: `model`, `diffusion`, `vae`, `taesd`
 `load` options: `backend`, `params_backend`, `max_vram`, `flash_attn`, `model_args`, `weight_type`, `mmap`, `eager_load`, `tae_preview_only`, `skip_memory_check`.
 
 `generate` params: `prompt`, `negative_prompt`, `width`, `height`, `steps`, `seed`, `cfg_scale`, `sample_method`, `scheduler`, `sigmas` (a list, or the preset `qwen-image-2.1-turbo`), `batch_count`, `flow_shift`.
+
+`generate` preview: `mode` (`none`, `proj`, `tae` or `vae`. Default `none`), `interval` (steps, default 2), `max_px` (default 256). The engine sends at most 4 previews each second, as base64 JPEG.
+
+Events during a job:
+
+- `stage`: `load`, `encode_prompt`, `sample` or `decode`. Layer 1 finds the stage in the upstream log text (`bsd_detect_stage`).
+- `progress`: `step`, `steps`, `sec_per_step`. Upstream also sends tensor loading as progress. Use it as a sampling step only in the `sample` stage.
+- `metrics`: device memory (`device`, `used_mib`, `free_mib`) at each stage change and at most once each second, or one stage duration (`timings`).
+- `done`: `outputs`, `timings` (`load_ms`, `encode_prompt_ms`, `sample_ms`, `decode_ms`, `total_ms`) and `peak_mib`.
 
 The engine sends `hello` first. It has `bsd_api_version`, `sd_commit`, `capabilities` and `devices`.
 

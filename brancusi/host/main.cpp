@@ -3,8 +3,12 @@
 // Transport: JSON lines. Commands on stdin, protocol messages on stdout, raw text on stderr.
 // The engine exits when stdin closes. See brancusi-desktop _docs/sd-cpp-interface.md section 3.4.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstring>
+#include <vector>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -144,6 +148,17 @@ private:
     std::thread thread_;
 };
 
+using Clock = std::chrono::steady_clock;
+
+struct JobStats {
+    int preview_max_px = 256;
+    Clock::time_point last_preview{};
+    Clock::time_point last_memory{};
+    json timings = json::object();
+    uint64_t min_free_bytes = UINT64_MAX;
+    uint64_t total_bytes    = 0;
+};
+
 struct State {
     bsd_engine_t* engine = nullptr;
     Writer* writer       = nullptr;
@@ -152,7 +167,12 @@ struct State {
     std::string current_id;
     std::string current_job;
     int log_level = BSD_LOG_INFO;
+    // Only the worker thread uses this (engine callbacks run on the worker thread).
+    JobStats stats;
 };
+
+constexpr auto kPreviewMinGap = std::chrono::milliseconds(250);  // At most 4 previews per second.
+constexpr auto kMemoryMinGap  = std::chrono::seconds(1);
 
 State g;
 
@@ -235,6 +255,84 @@ json info_json() {
     return m;
 }
 
+const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64(const std::string& in) {
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const uint32_t n = (uint8_t(in[i]) << 16) | (uint8_t(in[i + 1]) << 8) | uint8_t(in[i + 2]);
+        out += kBase64[(n >> 18) & 63];
+        out += kBase64[(n >> 12) & 63];
+        out += kBase64[(n >> 6) & 63];
+        out += kBase64[n & 63];
+    }
+    if (i < in.size()) {
+        uint32_t n = uint8_t(in[i]) << 16;
+        if (i + 1 < in.size()) n |= uint8_t(in[i + 1]) << 8;
+        out += kBase64[(n >> 18) & 63];
+        out += kBase64[(n >> 12) & 63];
+        out += i + 1 < in.size() ? kBase64[(n >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
+// Shrink to max_px on the long side (box filter), then encode as JPEG.
+std::string preview_jpeg(const bsd_image_t& img, int max_px) {
+    const int w = static_cast<int>(img.width), h = static_cast<int>(img.height), c = static_cast<int>(img.channels);
+    const int scale = std::max(1, (std::max(w, h) + max_px - 1) / max_px);
+    const int ow = std::max(1, w / scale), oh = std::max(1, h / scale);
+    std::vector<uint8_t> small(static_cast<size_t>(ow) * oh * 3);
+    for (int y = 0; y < oh; y++) {
+        for (int x = 0; x < ow; x++) {
+            for (int ch = 0; ch < 3; ch++) {
+                int sum = 0, n = 0;
+                for (int dy = 0; dy < scale; dy++) {
+                    for (int dx = 0; dx < scale; dx++) {
+                        const int sx = x * scale + dx, sy = y * scale + dy;
+                        if (sx < w && sy < h) {
+                            sum += img.data[(static_cast<size_t>(sy) * w + sx) * c + std::min(ch, c - 1)];
+                            n++;
+                        }
+                    }
+                }
+                small[(static_cast<size_t>(y) * ow + x) * 3 + ch] = static_cast<uint8_t>(n ? sum / n : 0);
+            }
+        }
+    }
+    std::string bytes;
+    stbi_write_jpg_to_func(
+        [](void* ctx, void* data, int size) { static_cast<std::string*>(ctx)->append(static_cast<char*>(data), size); },
+        &bytes, ow, oh, 3, small.data(), 80);
+    return bytes;
+}
+
+// Send device memory for the main GPU (or the CPU). Track the lowest free memory for peak use.
+void send_memory(bool force) {
+    const auto now = Clock::now();
+    if (!force && now - g.stats.last_memory < kMemoryMinGap) return;
+    g.stats.last_memory = now;
+    bsd_memory_t mem{};
+    mem.size = sizeof(mem);
+    bsd_memory(g.engine, &mem);
+    const bsd_device_memory_t* best = nullptr;
+    for (int i = 0; i < mem.device_count; i++) {
+        const auto& d = mem.devices[i];
+        if (d.total_bytes == 0) continue;
+        const bool gpu = std::strcmp(d.type, "cpu") != 0;
+        if (best == nullptr || (gpu && std::strcmp(best->type, "cpu") == 0)) best = &d;
+    }
+    if (best == nullptr) return;
+    g.stats.min_free_bytes = std::min<uint64_t>(g.stats.min_free_bytes, best->free_bytes);
+    g.stats.total_bytes    = best->total_bytes;
+    g.writer->send(tagged({{"event", "metrics"},
+                           {"device", best->name},
+                           {"used_mib", (best->total_bytes - best->free_bytes) / (1024 * 1024)},
+                           {"free_mib", best->free_bytes / (1024 * 1024)}}));
+}
+
 void on_event(const bsd_event_t* ev, void*) {
     switch (ev->type) {
         case BSD_EVENT_LOG: {
@@ -248,10 +346,34 @@ void on_event(const bsd_event_t* ev, void*) {
                                    {"step", ev->step},
                                    {"steps", ev->steps},
                                    {"sec_per_step", ev->sec_per_step}}));
+            send_memory(false);
             return;
         case BSD_EVENT_STAGE:
             g.writer->send(tagged({{"event", "stage"}, {"stage", ev->stage}}));
+            send_memory(true);
             return;
+        case BSD_EVENT_METRICS: {
+            if (ev->timing_name == nullptr) return;
+            // Loading can happen more than once in a job (lazy load). Add the times.
+            const std::string key = std::string(ev->timing_name) + "_ms";
+            const double prev     = g.stats.timings.value(key, 0.0);
+            g.stats.timings[key]  = std::round(prev + ev->timing_ms);
+            g.writer->send(tagged({{"event", "metrics"}, {"timings", {{key, std::round(ev->timing_ms)}}}}));
+            return;
+        }
+        case BSD_EVENT_PREVIEW: {
+            const auto now = Clock::now();
+            if (ev->preview == nullptr || now - g.stats.last_preview < kPreviewMinGap) return;
+            g.stats.last_preview = now;
+            const std::string jpeg = preview_jpeg(*ev->preview, g.stats.preview_max_px);
+            if (jpeg.empty()) return;
+            g.writer->send(tagged({{"event", "preview"},
+                                   {"step", ev->step},
+                                   {"steps", ev->steps},
+                                   {"mime", "image/jpeg"},
+                                   {"data", base64(jpeg)}}));
+            return;
+        }
         default:
             return;
     }
@@ -329,6 +451,10 @@ void do_generate(const std::string& id, const json& cmd) {
     const std::string prompt = str_or(p, "prompt"), negative = str_or(p, "negative_prompt"),
                       method = str_or(p, "sample_method"), scheduler = str_or(p, "scheduler"),
                       sigmas = str_or(p, "sigmas");
+    const json preview             = cmd.value("preview", json::object());
+    const std::string preview_mode = str_or(preview, "mode", "none");
+    g.stats                        = JobStats{};
+    g.stats.preview_max_px         = std::clamp(preview.value("max_px", 256), 32, 1024);
     bsd_image_params_t params{};
     params.size            = sizeof(params);
     params.prompt          = prompt.c_str();
@@ -343,6 +469,8 @@ void do_generate(const std::string& id, const json& cmd) {
     params.sigmas          = c_or_null(sigmas);
     params.batch_count     = p.value("batch_count", 1);
     params.flow_shift      = p.value("flow_shift", 0.0f);
+    params.preview_mode    = preview_mode.c_str();
+    params.preview_interval = preview.value("interval", 2);
 
     const auto start      = std::chrono::steady_clock::now();
     bsd_result_t* result  = nullptr;
@@ -369,7 +497,13 @@ void do_generate(const std::string& id, const json& cmd) {
         outputs.push_back({{"path", path_str}, {"width", img.width}, {"height", img.height}, {"seed", result->seeds[i]}});
     }
     bsd_free_result(result);
-    g.writer->send({{"id", id}, {"event", "done"}, {"job", job}, {"outputs", outputs}, {"timings", {{"total_ms", ms_since(start)}}}});
+    json timings        = g.stats.timings;
+    timings["total_ms"] = ms_since(start);
+    json done = {{"id", id}, {"event", "done"}, {"job", job}, {"outputs", outputs}, {"timings", timings}};
+    if (g.stats.min_free_bytes != UINT64_MAX) {
+        done["peak_mib"] = (g.stats.total_bytes - g.stats.min_free_bytes) / (1024 * 1024);
+    }
+    g.writer->send(done);
     set_current("", "");
 }
 

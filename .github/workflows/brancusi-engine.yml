@@ -1,0 +1,110 @@
+name: brancusi-engine
+
+# Builds brancusi-engine for the first variants and runs the bsd unit tests (no model).
+# A tag "brancusi-v*" also publishes a release with one zip per variant and a manifest
+# (size and SHA-256) for engine.json in brancusi-desktop.
+
+on:
+  push:
+    branches: [brancusi]
+    tags: ["brancusi-v*"]
+  pull_request:
+    paths: ["brancusi/**", "CMakeLists.txt", ".github/workflows/brancusi-engine.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: darwin-arm64-metal
+            os: macos-15
+            cmake: -DSD_METAL=ON
+          - variant: linux-x64-vulkan
+            os: ubuntu-22.04
+            cmake: -DSD_VULKAN=ON
+          - variant: linux-x64-cpu
+            os: ubuntu-22.04
+            cmake: ""
+          - variant: win-x64-vulkan
+            os: windows-2022
+            cmake: -DSD_VULKAN=ON
+          - variant: win-x64-cuda12
+            os: windows-2022
+            cmake: -DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
+          - variant: win-x64-cpu
+            os: windows-2022
+            cmake: ""
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Vulkan SDK (Linux)
+        if: contains(matrix.variant, 'vulkan') && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc
+
+      - name: Vulkan SDK (Windows)
+        if: contains(matrix.variant, 'vulkan') && runner.os == 'Windows'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: CUDA toolkit
+        if: contains(matrix.variant, 'cuda')
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: "12.8.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_BRANCUSI=ON ${{ matrix.cmake }}
+
+      - name: Build
+        run: cmake --build build --config Release -j 4 --target brancusi-engine bsd-tests
+
+      - name: Unit tests
+        # CUDA and Vulkan runners have no GPU. The tests need no model, but a GPU build
+        # can fail to start without a device, so run them on Metal and CPU builds only.
+        if: ${{ !contains(matrix.variant, 'cuda') && !contains(matrix.variant, 'vulkan') }}
+        run: |
+          if [[ -f build/bin/bsd-tests ]]; then build/bin/bsd-tests; else build/bin/Release/bsd-tests.exe; fi
+
+      - name: CUDA runtime DLLs
+        if: contains(matrix.variant, 'cuda')
+        run: cp "$CUDA_PATH"/bin/cudart64_*.dll "$CUDA_PATH"/bin/cublas64_*.dll "$CUDA_PATH"/bin/cublasLt64_*.dll build/bin/Release/
+
+      - name: Package
+        run: mkdir -p dist && brancusi/scripts/package.sh ${{ matrix.variant }} build dist | tee dist/${{ matrix.variant }}.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/brancusi-v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Manifest
+        run: jq -s 'map({(.variant): {file, size, sha256}}) | add' dist/*.json > dist/manifest.json
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/manifest.json --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes "brancusi-engine $GITHUB_REF_NAME"
