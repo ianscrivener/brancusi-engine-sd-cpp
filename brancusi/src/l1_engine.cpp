@@ -671,13 +671,13 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
         if (!is_disk_part(opts.params_backend, static_cast<bsd_component_t>(i))) {
             needed += bytes;
         } else if (is_te_part(static_cast<bsd_component_t>(i))) {
-            // The text encoder runs first and is released before sampling, so it does not add to the kept parts.
             te_disk += bytes;
         } else {
             largest_disk = std::max(largest_disk, bytes);
         }
     }
-    needed = std::max(needed, te_disk) + largest_disk;
+    // Kept parts stay loaded. A `disk` part loads and releases in turn, so only the largest one adds to them.
+    needed += std::max(te_disk, largest_disk);
     if (!any) {
         return fail(e, BSD_ERR_INVALID_ARGUMENT, "No model parts given.");
     }

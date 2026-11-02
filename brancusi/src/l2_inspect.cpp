@@ -105,6 +105,9 @@ bsd_status_t inspect(const bsd_components_t* parts, int wtype, bsd_inspect_t* ou
             continue;
         }
         const auto which = static_cast<bsd_component_t>(i);
+        if (which == BSD_COMPONENT_TOKENIZER) {
+            continue;  // A vocabulary or JSON file, not a model file.
+        }
         const std::string prefix = part_prefix(which);
         // One loader for each part gives the counts and types of that part only.
         ModelLoader one;
