@@ -96,7 +96,7 @@ private:
     std::thread thread_;
 };
 
-// ---- Long work (load, unload, generate) runs on one worker thread. ----
+// ---- Long work (load, unload, generate, convert, inspect) runs on one worker thread. ----
 
 class Worker {
 public:
@@ -252,7 +252,67 @@ json info_json() {
               {"loaded", info.loaded != 0},
               {"devices", devices_json()}};
     if (info.model_version) m["model_version"] = info.model_version;
+    if (info.loaded) {
+        m["default_sample_method"] = info.default_sample_method ? info.default_sample_method : "";
+        m["default_scheduler"]     = info.default_scheduler ? info.default_scheduler : "";
+        m["image_generation"]      = (info.capabilities & BSD_CAP_IMAGE) != 0;
+        m["video_generation"]      = (info.capabilities & BSD_CAP_VIDEO) != 0;
+    }
     return m;
+}
+
+// "SSE3 = 1 | AVX = 0 | " to {"SSE3": true, "AVX": false}. The engine ignores items without "=".
+json system_features(const std::string& text) {
+    json out = json::object();
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('|', start);
+        if (end == std::string::npos) end = text.size();
+        const std::string item = text.substr(start, end - start);
+        const size_t eq        = item.find('=');
+        if (eq != std::string::npos) {
+            auto trim = [](std::string v) {
+                const size_t a = v.find_first_not_of(" \t\n");
+                const size_t b = v.find_last_not_of(" \t\n");
+                return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+            };
+            std::string key = item.substr(0, eq);
+            const size_t head = key.find_last_of(":\n");  // Drop the "System Info:" title.
+            if (head != std::string::npos) key = key.substr(head + 1);
+            key = trim(key);
+            const std::string value = trim(item.substr(eq + 1));
+            if (!key.empty()) out[key] = value != "0";
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+json hardware_json() {
+    bsd_info_t info{};
+    info.size = sizeof(info);
+    bsd_info(g.engine, &info);
+    const std::string system_info = info.system_info ? info.system_info : "";
+    return {{"system_info", system_info},
+            {"features", system_features(system_info)},
+            {"physical_cores", info.physical_cores},
+            {"n_threads", info.n_threads},
+            {"devices", devices_json()}};
+}
+
+json table_json(bsd_table_t table) {
+    json out = json::array();
+    for (int32_t i = 0; i < bsd_table_size(table); i++) {
+        const char* name = bsd_table_name(table, i);
+        if (name != nullptr && name[0] != '\0') out.push_back(name);
+    }
+    return out;
+}
+
+json schedulers_json() {
+    return {{"samplers", table_json(BSD_TABLE_SAMPLE_METHOD)},
+            {"schedulers", table_json(BSD_TABLE_SCHEDULER)},
+            {"types", table_json(BSD_TABLE_WEIGHT_TYPE)}};
 }
 
 const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -385,26 +445,94 @@ long long ms_since(std::chrono::steady_clock::time_point start) {
 
 // ---- Commands ----
 
-void do_load(const std::string& id, const json& cmd) {
-    set_current(id, "");
-    // Keep the strings alive for the call.
+// Model parts of a command: part name to path. The strings stay alive while this object lives.
+struct Parts {
     std::string paths[BSD_COMPONENT_COUNT];
     bsd_components_t components{};
-    components.size = sizeof(components);
-    const json comps = cmd.value("components", json::object());
-    for (auto it = comps.begin(); it != comps.end(); ++it) {
-        int index = -1;
-        for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
-            if (it.key() == bsd_component_name(static_cast<bsd_component_t>(i))) index = i;
-        }
-        if (index < 0 || !it->is_string()) {
-            g.writer->send(error_message(id, BSD_ERR_INVALID_ARGUMENT, "Unknown model part: " + it.key()));
-            set_current("", "");
+    std::string bad_key;  // Set if a key is not a part name or a value is not a string.
+
+    explicit Parts(const json& comps) {
+        components.size = sizeof(components);
+        if (!comps.is_object()) {
+            bad_key = "components";
             return;
         }
-        paths[index]                = it->get<std::string>();
-        components.paths[index]     = paths[index].c_str();
+        for (auto it = comps.begin(); it != comps.end(); ++it) {
+            int index = -1;
+            for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
+                if (it.key() == bsd_component_name(static_cast<bsd_component_t>(i))) index = i;
+            }
+            if (index < 0 || !it->is_string()) {
+                bad_key = it.key();
+                return;
+            }
+            paths[index]            = it->get<std::string>();
+            components.paths[index] = paths[index].c_str();
+        }
     }
+};
+
+json part_info_json(const bsd_part_info_t& p, bool sizes) {
+    json types = json::object();
+    for (int t = 0; t < p.type_count; t++) types[p.types[t].name] = p.types[t].tensors;
+    json m = {{"tensors", p.tensors}, {"types", types}};
+    if (p.type_count > 0) m["type"] = p.types[0].name;
+    if (sizes) {
+        m["params"] = p.params;
+        m["bytes"]  = p.bytes;
+    }
+    return m;
+}
+
+void do_inspect(const std::string& id, const json& cmd) {
+    set_current(id, "");
+    Parts parts(cmd.value("components", json::object()));
+    if (!parts.bad_key.empty()) {
+        g.writer->send(error_message(id, BSD_ERR_INVALID_ARGUMENT, "Unknown model part: " + parts.bad_key));
+        set_current("", "");
+        return;
+    }
+    const std::string weight_type = str_or(cmd, "weight_type");
+    const auto start              = std::chrono::steady_clock::now();
+    bsd_inspect_t r{};
+    r.size                = sizeof(r);
+    const bsd_status_t st = bsd_inspect(g.engine, &parts.components, c_or_null(weight_type), &r);
+    if (st != BSD_OK) {
+        g.writer->send(engine_error(id, st));
+        set_current("", "");
+        return;
+    }
+    json part_map = json::object();
+    for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
+        if (r.parts[i].present) part_map[bsd_component_name(static_cast<bsd_component_t>(i))] = part_info_json(r.parts[i], true);
+    }
+    json contents = json::object();
+    for (int i = 0; i < BSD_CONTENT_COUNT; i++) {
+        if (r.contents[i].present) contents[bsd_content_name(static_cast<bsd_content_t>(i))] = part_info_json(r.contents[i], false);
+    }
+    g.writer->send({{"id", id},
+                    {"event", "inspect"},
+                    {"family", r.family},
+                    {"known", r.family[0] != '\0'},
+                    {"parts", part_map},
+                    {"contents", contents},
+                    {"tensors", r.tensors},
+                    {"params", r.params},
+                    {"mem_bytes", r.mem_bytes},
+                    {"mem_mib", r.mem_bytes / (1024 * 1024)},
+                    {"ms", ms_since(start)}});
+    set_current("", "");
+}
+
+void do_load(const std::string& id, const json& cmd) {
+    set_current(id, "");
+    Parts parts(cmd.value("components", json::object()));
+    if (!parts.bad_key.empty()) {
+        g.writer->send(error_message(id, BSD_ERR_INVALID_ARGUMENT, "Unknown model part: " + parts.bad_key));
+        set_current("", "");
+        return;
+    }
+    bsd_components_t& components = parts.components;
 
     const json o = cmd.value("options", json::object());
     const std::string backend = str_or(o, "backend"), params_backend = str_or(o, "params_backend"),
@@ -507,6 +635,45 @@ void do_generate(const std::string& id, const json& cmd) {
     set_current("", "");
 }
 
+void do_convert(const std::string& id, const json& cmd) {
+    set_current(id, "");
+    g.stats = JobStats{};
+    const std::string input = str_or(cmd, "input"), output = str_or(cmd, "output"), type = str_or(cmd, "type"),
+                      rules = str_or(cmd, "rules");
+    const int32_t convert_name = cmd.value("convert_name", false) ? 1 : 0;
+    // Either one `input` file, or `components` (part name to path) to merge into one file.
+    const bool has_parts = cmd.contains("components");
+    if (has_parts == !input.empty()) {
+        g.writer->send(error_message(id, BSD_ERR_INVALID_ARGUMENT, "Give either input or components."));
+        set_current("", "");
+        return;
+    }
+    Parts parts(has_parts ? cmd["components"] : json::object());
+    if (!parts.bad_key.empty()) {
+        g.writer->send(error_message(id, BSD_ERR_INVALID_ARGUMENT, "Unknown model part: " + parts.bad_key));
+        set_current("", "");
+        return;
+    }
+    const auto start      = std::chrono::steady_clock::now();
+    const bsd_status_t st = has_parts
+                                ? bsd_convert_parts(g.engine, &parts.components, c_or_null(output), c_or_null(type),
+                                                    c_or_null(rules), convert_name)
+                                : bsd_convert(g.engine, c_or_null(input), c_or_null(output), c_or_null(type),
+                                              c_or_null(rules), convert_name);
+    if (st != BSD_OK) {
+        g.writer->send(engine_error(id, st));
+    } else {
+        std::error_code ec;
+        const auto bytes = fs::file_size(fs::u8path(output), ec);
+        g.writer->send({{"id", id},
+                        {"event", "ok"},
+                        {"output", output},
+                        {"bytes", ec ? 0 : static_cast<uint64_t>(bytes)},
+                        {"ms", ms_since(start)}});
+    }
+    set_current("", "");
+}
+
 void handle(const std::string& line, Worker& worker) {
     json cmd;
     try {
@@ -529,6 +696,16 @@ void handle(const std::string& line, Worker& worker) {
         g.writer->send(m);
     } else if (name == "memory") {
         g.writer->send({{"id", id}, {"event", "memory"}, {"devices", devices_json()}});
+    } else if (name == "hardware") {
+        json m    = hardware_json();
+        m["id"]    = id;
+        m["event"] = "hardware";
+        g.writer->send(m);
+    } else if (name == "schedulers") {
+        json m    = schedulers_json();
+        m["id"]    = id;
+        m["event"] = "schedulers";
+        g.writer->send(m);
     } else if (name == "cancel") {
         const std::string job = str_or(cmd, "job");
         std::string running_job;
@@ -540,9 +717,13 @@ void handle(const std::string& line, Worker& worker) {
             bsd_cancel(g.engine, str_or(cmd, "mode") == "new_latents" ? BSD_CANCEL_NEW_LATENTS : BSD_CANCEL_ALL);
         }
         g.writer->send({{"id", id}, {"event", "ok"}});
-    } else if (name == "load" || name == "unload" || name == "generate") {
+    } else if (name == "load" || name == "unload" || name == "generate" || name == "convert" || name == "inspect") {
         std::function<void()> task;
-        if (name == "load") {
+        if (name == "inspect") {
+            task = [id, cmd] { do_inspect(id, cmd); };
+        } else if (name == "convert") {
+            task = [id, cmd] { do_convert(id, cmd); };
+        } else if (name == "load") {
             task = [id, cmd] { do_load(id, cmd); };
         } else if (name == "generate") {
             task = [id, cmd] { do_generate(id, cmd); };

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "ggml-backend.h"
+#include "l2.h"
 #include "stable-diffusion.h"
 
 namespace fs = std::filesystem;
@@ -53,6 +54,8 @@ const char* const kComponentNames[BSD_COMPONENT_COUNT] = {
     "photo_maker", "pulid", "motion_module", "audio_vae", "audio_encoder",
     "embeddings_connectors", "tokenizer",
 };
+
+const char* const kContentNames[BSD_CONTENT_COUNT] = {"diffusion", "text_encoder", "vae"};
 
 const char* const kStatusNames[BSD_STATUS_COUNT] = {
     "ok", "out_of_memory", "missing_file", "bad_model", "cancelled", "unsupported",
@@ -271,6 +274,49 @@ const char* bsd_component_name(bsd_component_t c) {
     return kComponentNames[c];
 }
 
+const char* bsd_content_name(bsd_content_t c) {
+    if (c < 0 || c >= BSD_CONTENT_COUNT) {
+        return "unknown";
+    }
+    return kContentNames[c];
+}
+
+int32_t bsd_table_size(bsd_table_t table) {
+    switch (table) {
+        case BSD_TABLE_SAMPLE_METHOD:
+            return SAMPLE_METHOD_COUNT;
+        case BSD_TABLE_SCHEDULER:
+            return SCHEDULER_COUNT;
+        case BSD_TABLE_WEIGHT_TYPE:
+            return SD_TYPE_COUNT;
+        default:
+            return 0;
+    }
+}
+
+const char* bsd_table_name(bsd_table_t table, int32_t index) {
+    if (index < 0 || index >= bsd_table_size(table)) {
+        return nullptr;
+    }
+    switch (table) {
+        case BSD_TABLE_SAMPLE_METHOD:
+            return sd_sample_method_name(static_cast<sample_method_t>(index));
+        case BSD_TABLE_SCHEDULER:
+            return sd_scheduler_name(static_cast<scheduler_t>(index));
+        case BSD_TABLE_WEIGHT_TYPE: {
+            // Upstream keeps removed types as gaps. A name that does not map back is a gap.
+            const char* name = sd_type_name(static_cast<sd_type_t>(index));
+            if (name == nullptr || str_to_sd_type(name) != static_cast<sd_type_t>(index) ||
+                std::strcmp(name, "DEPRECATED") == 0 || std::strchr(name, ' ') != nullptr) {
+                return "";
+            }
+            return name;
+        }
+        default:
+            return nullptr;
+    }
+}
+
 bsd_status_t bsd_classify_failure(const char* log_text) {
     if (log_text == nullptr) {
         return BSD_ERR_INTERNAL;
@@ -417,11 +463,20 @@ bsd_status_t bsd_info(bsd_engine_t* e, bsd_info_t* out) {
     out->system_info  = sd_get_system_info();
     out->capabilities = BSD_CAP_CANCEL | BSD_CAP_MEMORY;
     out->loaded       = e->ctx != nullptr ? 1 : 0;
+    out->physical_cores = sd_get_num_physical_cores();
+    out->n_threads      = e->n_threads;
     if (e->ctx != nullptr) {
         out->model_version = sd_get_model_version_name(e->ctx);
         if (sd_ctx_supports_image_generation(e->ctx)) {
             out->capabilities |= BSD_CAP_IMAGE;
         }
+        if (sd_ctx_supports_video_generation(e->ctx)) {
+            out->capabilities |= BSD_CAP_VIDEO;
+        }
+        const sample_method_t method = sd_get_default_sample_method(e->ctx);
+        out->default_sample_method   = method < SAMPLE_METHOD_COUNT ? sd_sample_method_name(method) : nullptr;
+        const scheduler_t scheduler  = sd_get_default_scheduler(e->ctx, method);
+        out->default_scheduler       = scheduler < SCHEDULER_COUNT ? sd_scheduler_name(scheduler) : nullptr;
     }
     return BSD_OK;
 }
@@ -436,6 +491,112 @@ bsd_status_t bsd_unload(bsd_engine_t* e) {
     if (e->ctx != nullptr) {
         free_sd_ctx(e->ctx);
         e->ctx = nullptr;
+    }
+    return BSD_OK;
+}
+
+bsd_status_t bsd_convert_parts(bsd_engine_t* e, const bsd_components_t* parts, const char* output,
+                               const char* type, const char* rules, int32_t convert_name) {
+    if (e == nullptr || parts == nullptr) {
+        return BSD_ERR_INVALID_ARGUMENT;
+    }
+    if (e->ctx != nullptr) {
+        return fail(e, BSD_ERR_BUSY, "A model is loaded. Unload it before you convert.");
+    }
+    if (!is_set(output) || !is_set(type)) {
+        return fail(e, BSD_ERR_INVALID_ARGUMENT, "Give an output file and a type.");
+    }
+    const sd_type_t out_type = str_to_sd_type(type);
+    if (out_type == SD_TYPE_COUNT) {
+        return fail(e, BSD_ERR_INVALID_ARGUMENT, std::string("Unknown type: ") + type);
+    }
+    // Parts that upstream convert_with_components() can merge.
+    static const bsd_component_t kMergeable[] = {BSD_COMPONENT_MODEL, BSD_COMPONENT_DIFFUSION, BSD_COMPONENT_CLIP_L,
+                                                 BSD_COMPONENT_CLIP_G, BSD_COMPONENT_T5XXL, BSD_COMPONENT_VAE};
+    bool any = false;
+    for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
+        const char* path = parts->paths[i];
+        if (!is_set(path)) {
+            continue;
+        }
+        if (std::find(std::begin(kMergeable), std::end(kMergeable), static_cast<bsd_component_t>(i)) == std::end(kMergeable)) {
+            return fail(e, BSD_ERR_UNSUPPORTED,
+                        std::string("A conversion cannot include the part '") + kComponentNames[i] + "'.");
+        }
+        std::error_code ec;
+        if (!fs::exists(fs::u8path(path), ec)) {
+            return fail(e, BSD_ERR_MISSING_FILE,
+                        std::string("The input file does not exist for part '") + kComponentNames[i] + "': " + path);
+        }
+        any = true;
+    }
+    if (!any) {
+        return fail(e, BSD_ERR_INVALID_ARGUMENT, "Give an input file.");
+    }
+    auto path = [&](bsd_component_t which) { return is_set(parts->paths[which]) ? parts->paths[which] : nullptr; };
+    clear_recent_log(e);
+    emit_stage(e, "convert");
+    const bool ok = convert_with_components(path(BSD_COMPONENT_MODEL), path(BSD_COMPONENT_CLIP_L), path(BSD_COMPONENT_CLIP_G),
+                                            path(BSD_COMPONENT_T5XXL), path(BSD_COMPONENT_DIFFUSION), path(BSD_COMPONENT_VAE),
+                                            output, out_type, is_set(rules) ? rules : "", convert_name != 0, e->n_threads,
+                                            nullptr, 0);
+    if (!ok) {
+        const std::string log = recent_log_text(e);
+        const bsd_status_t st = bsd_classify_failure(log.c_str());
+        return fail(e, st, st == BSD_ERR_OUT_OF_MEMORY ? "Out of memory while converting." : "The conversion failed.", log);
+    }
+    return BSD_OK;
+}
+
+bsd_status_t bsd_convert(bsd_engine_t* e, const char* input, const char* output, const char* type,
+                         const char* rules, int32_t convert_name) {
+    if (e == nullptr) {
+        return BSD_ERR_INVALID_ARGUMENT;
+    }
+    if (!is_set(input)) {
+        return fail(e, BSD_ERR_INVALID_ARGUMENT, "Give an input file, an output file and a type.");
+    }
+    bsd_components_t parts{};
+    parts.size                     = sizeof(parts);
+    parts.paths[BSD_COMPONENT_MODEL] = input;
+    return bsd_convert_parts(e, &parts, output, type, rules, convert_name);
+}
+
+bsd_status_t bsd_inspect(bsd_engine_t* e, const bsd_components_t* parts, const char* weight_type, bsd_inspect_t* out) {
+    if (e == nullptr || parts == nullptr || out == nullptr) {
+        return BSD_ERR_INVALID_ARGUMENT;
+    }
+    *out      = bsd_inspect_t{};
+    out->size = sizeof(*out);
+    bool any  = false;
+    for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
+        const char* path = parts->paths[i];
+        if (!is_set(path)) {
+            continue;
+        }
+        std::error_code ec;
+        if (!fs::exists(fs::u8path(path), ec)) {
+            return fail(e, BSD_ERR_MISSING_FILE,
+                        std::string("Model file not found for part '") + kComponentNames[i] + "': " + path);
+        }
+        any = true;
+    }
+    if (!any) {
+        return fail(e, BSD_ERR_INVALID_ARGUMENT, "No model parts given.");
+    }
+    int wtype = -1;
+    if (is_set(weight_type)) {
+        const sd_type_t t = str_to_sd_type(weight_type);
+        if (t == SD_TYPE_COUNT) {
+            return fail(e, BSD_ERR_INVALID_ARGUMENT, std::string("Unknown weight type: ") + weight_type);
+        }
+        wtype = static_cast<int>(t);
+    }
+    clear_recent_log(e);
+    std::string error;
+    const bsd_status_t st = bsd_l2::inspect(parts, wtype, out, error);
+    if (st != BSD_OK) {
+        return fail(e, st, error, recent_log_text(e));
     }
     return BSD_OK;
 }

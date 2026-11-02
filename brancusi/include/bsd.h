@@ -202,7 +202,54 @@ typedef struct {
     uint64_t capabilities;
     int32_t loaded;
     const char* model_version; /* NULL when no model is loaded. */
+    /* Added after the first release. */
+    int32_t physical_cores;
+    int32_t n_threads;
+    const char* default_sample_method; /* NULL when no model is loaded. */
+    const char* default_scheduler;     /* NULL when no model is loaded. */
 } bsd_info_t;
+
+/* Name tables of the engine. See bsd_table_name(). */
+typedef enum {
+    BSD_TABLE_SAMPLE_METHOD = 0,
+    BSD_TABLE_SCHEDULER,
+    BSD_TABLE_WEIGHT_TYPE,
+    BSD_TABLE_COUNT
+} bsd_table_t;
+
+/* What a model file holds, found from the tensor names. */
+typedef enum {
+    BSD_CONTENT_DIFFUSION = 0,
+    BSD_CONTENT_TEXT_ENCODER,
+    BSD_CONTENT_VAE,
+    BSD_CONTENT_COUNT
+} bsd_content_t;
+
+#define BSD_MAX_PART_TYPES 8
+
+typedef struct {
+    char name[16]; /* Weight type name, for example "f16". */
+    uint32_t tensors;
+} bsd_type_count_t;
+
+typedef struct {
+    int32_t present;      /* 1 if the part is given (or found, for contents). */
+    uint32_t tensors;
+    uint64_t params;      /* Number of weights. 0 for contents. */
+    uint64_t bytes;       /* Weight bytes in the file types. 0 for contents. */
+    int32_t type_count;   /* Number of entries in types, most tensors first. */
+    bsd_type_count_t types[BSD_MAX_PART_TYPES];
+} bsd_part_info_t;
+
+typedef struct {
+    uint32_t size;
+    char family[64];      /* Upstream version name, for example "SD 1.x". "" if unknown. */
+    uint32_t tensors;
+    uint64_t params;
+    uint64_t mem_bytes;   /* Estimated weight memory with the load-time weight type. */
+    bsd_part_info_t parts[BSD_COMPONENT_COUNT];   /* Indexed by bsd_component_t. */
+    bsd_part_info_t contents[BSD_CONTENT_COUNT];  /* Indexed by bsd_content_t. */
+} bsd_inspect_t;
 
 int bsd_api_version(void);
 const char* bsd_status_name(bsd_status_t status);
@@ -217,6 +264,36 @@ const char* bsd_last_error_detail(const bsd_engine_t* engine);
 bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load_options_t* o);
 bsd_status_t bsd_unload(bsd_engine_t* e);
 
+/*
+ * Write model parts into one GGUF file (or safetensors, by the output extension). Calls upstream
+ * convert_with_components(). Only these parts are allowed: model, diffusion, clip_l, clip_g,
+ * t5xxl and vae. Other parts return BSD_ERR_UNSUPPORTED. The other arguments and rules are the
+ * same as for bsd_convert(). In `rules`, the tensor names have the part prefix, for example
+ * "model.diffusion_model.", "text_encoders.clip_l.transformer." or "vae.". With convert_name,
+ * the rules match the converted names, for example "first_stage_model." for the VAE.
+ */
+bsd_status_t bsd_convert_parts(bsd_engine_t* e, const bsd_components_t* parts, const char* output,
+                               const char* type, const char* rules, int32_t convert_name);
+
+/*
+ * Layer 2. Read the file headers of the given parts, not the weights. Needs no loaded model.
+ * `weight_type` is an optional load-time type for mem_bytes. NULL: keep the file types.
+ * Returns BSD_ERR_MISSING_FILE or BSD_ERR_BAD_MODEL if a part cannot be read. An unknown
+ * model family is not an error: family is "".
+ */
+bsd_status_t bsd_inspect(bsd_engine_t* e, const bsd_components_t* parts, const char* weight_type,
+                         bsd_inspect_t* out);
+
+/*
+ * Write one model file as GGUF (or safetensors, by the output extension) with a new weight type.
+ * Calls upstream convert(). `type` is a type name such as "q8_0". `rules` is an optional list of
+ * "regex=type" pairs for single tensors (upstream tensor type rules). Needs no loaded model:
+ * returns BSD_ERR_BUSY while a model is loaded. Reports BSD_EVENT_PROGRESS (step = tensors
+ * written). It cannot be cancelled: the host stops the process.
+ */
+bsd_status_t bsd_convert(bsd_engine_t* e, const char* input, const char* output, const char* type,
+                         const char* rules, int32_t convert_name);
+
 /* Work */
 bsd_status_t bsd_generate_image(bsd_engine_t* e, const bsd_image_params_t* p, bsd_result_t** out);
 void bsd_cancel(bsd_engine_t* e, bsd_cancel_mode_t mode);
@@ -229,6 +306,11 @@ void bsd_set_event_cb(bsd_engine_t* e, bsd_event_cb_t cb, void* user);
 
 /* Helpers, exposed for tests. */
 const char* bsd_component_name(bsd_component_t c);
+const char* bsd_content_name(bsd_content_t c);
+/* Number of entries in a name table. */
+int32_t bsd_table_size(bsd_table_t table);
+/* One name of a table. NULL if index is out of range. "" for an unused slot. */
+const char* bsd_table_name(bsd_table_t table, int32_t index);
 /* Map recent upstream log text to a status. Used when upstream gives no other signal. */
 bsd_status_t bsd_classify_failure(const char* log_text);
 /*
