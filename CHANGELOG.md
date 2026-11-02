@@ -125,3 +125,8 @@ Two CodeRabbit fixes. Each step lists the file, the cause, the change and the te
 - Cause: when the model did not fit, the load stopped with `out_of_memory`. Upstream auto-fit can put a part in CPU memory, which is a second copy on unified memory.
 - Change: `auto_fit` `true` adds `te=disk`, then `diffusion=disk`, then `vae=disk` until the pre-load memory check passes. `true` and `false` set upstream auto-fit off. `loaded` and `info` have `params_backend`. The pre-load check uses a `max_vram` budget. A module entry in `params_backend` now overrides the default in any order, as in upstream. `hello` lists `auto_fit` and `peak_bytes` in `capabilities`.
 - Test: `bsd-tests` checks the plan with sparse files. A load with `auto_fit` and `max_vram` 9 chose `te=disk,diffusion=disk` and made the image.
+
+---
+22:23 Monday 2 November 2026
+
+**Version 0.1.3.** Release build.
