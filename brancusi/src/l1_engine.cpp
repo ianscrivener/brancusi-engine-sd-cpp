@@ -28,6 +28,7 @@ namespace fs = std::filesystem;
 struct bsd_engine {
     int n_threads = 0;
     sd_ctx_t* ctx = nullptr;
+    std::string params_backend;  // Of the loaded model, after auto-fit.
     std::string error;
     std::string error_detail;
 
@@ -238,25 +239,90 @@ bool is_te_part(bsd_component_t part) {
            part == BSD_COMPONENT_T5XXL || part == BSD_COMPONENT_LLM || part == BSD_COMPONENT_LLM_VISION;
 }
 
-// True when `params_backend` puts the module of this part on `disk`. Upstream syntax: a bare
-// `disk`, `all=disk`, or per-module entries such as `te=disk,vae=disk`.
-bool is_disk_part(const char* params_backend, bsd_component_t part) {
-    if (!is_set(params_backend)) {
-        return false;
+// The params_backend module of a part: "te", "vae" or "diffusion".
+const char* module_of(bsd_component_t part) {
+    return is_te_part(part) ? "te" : (part == BSD_COMPONENT_VAE || part == BSD_COMPONENT_TAESD) ? "vae" : "diffusion";
+}
+
+// Upstream module key to "te", "vae", "diffusion", "all" or "" (another module). Upstream ignores
+// case, '-' and '_' in module names.
+std::string module_key(std::string key) {
+    key = lower(key);
+    key.erase(std::remove_if(key.begin(), key.end(), [](char ch) { return ch == '-' || ch == '_' || ch == ' '; }), key.end());
+    if (key == "all" || key == "default" || key == "*") return "all";
+    if (key == "diffusion" || key == "model" || key == "unet" || key == "dit") return "diffusion";
+    if (key == "te" || key == "clip" || key == "text" || key == "textencoder" || key == "textencoders" ||
+        key == "conditioner" || key == "cond" || key == "llm" || key == "t5" || key == "t5xxl") {
+        return "te";
     }
-    const char* module = is_te_part(part) ? "te" : (part == BSD_COMPONENT_VAE || part == BSD_COMPONENT_TAESD) ? "vae" : "diffusion";
-    bool disk = false;
-    std::stringstream entries(lower(params_backend));
-    std::string entry;
-    while (std::getline(entries, entry, ',')) {
-        const size_t eq        = entry.find('=');
-        const std::string key  = eq == std::string::npos ? "all" : entry.substr(0, eq);
-        const std::string val  = eq == std::string::npos ? entry : entry.substr(eq + 1);
-        if (key == "all" || key == module) {
-            disk = val == "disk";
+    if (key == "vae" || key == "firststage" || key == "autoencoder" || key == "tae") return "vae";
+    return "";
+}
+
+// The value that `params_backend` gives a module. A module entry overrides the default (a bare
+// value or `all=`), in any order, as in upstream. `named` tells if the module has its own entry.
+std::string module_value(const char* params_backend, const char* module, bool* named = nullptr) {
+    std::string def, own;
+    bool has_own = false;
+    if (is_set(params_backend)) {
+        std::stringstream entries(params_backend);
+        std::string entry;
+        while (std::getline(entries, entry, ',')) {
+            const size_t eq = entry.find('=');
+            const std::string key = eq == std::string::npos ? "all" : module_key(entry.substr(0, eq));
+            std::string val       = lower(eq == std::string::npos ? entry : entry.substr(eq + 1));
+            val.erase(std::remove(val.begin(), val.end(), ' '), val.end());
+            if (key == "all") {
+                def = val;
+            } else if (key == module) {
+                own     = val;
+                has_own = true;
+            }
         }
     }
-    return disk;
+    if (named != nullptr) *named = has_own;
+    return has_own ? own : def;
+}
+
+bool is_disk_part(const char* params_backend, bsd_component_t part) {
+    return module_value(params_backend, module_of(part)) == "disk";
+}
+
+// True when a module of the plan stores weights in host memory.
+bool uses_host(const std::string& params_backend) {
+    const std::string pb = lower(params_backend);
+    return pb.find("cpu") != std::string::npos || pb.find("disk") != std::string::npos;
+}
+
+// A `max_vram` budget for a device, in bytes, from the free bytes. Upstream syntax: a bare GiB
+// value or `all=`, or `<device>=<GiB>`. A negative value means free memory less that many GiB.
+uint64_t budget_bytes(const char* max_vram, const std::string& device, uint64_t free_bytes) {
+    if (!is_set(max_vram)) return free_bytes;
+    double def = 0, own = 0;
+    bool has_own = false;
+    std::stringstream entries(max_vram);
+    std::string entry;
+    while (std::getline(entries, entry, ',')) {
+        const size_t eq = entry.find('=');
+        const std::string key = eq == std::string::npos ? "all" : lower(entry.substr(0, eq));
+        const std::string val = eq == std::string::npos ? entry : entry.substr(eq + 1);
+        char* end             = nullptr;
+        const double gib_val  = std::strtod(val.c_str(), &end);
+        if (end == val.c_str() || !std::isfinite(gib_val)) continue;
+        std::string k = key;
+        k.erase(std::remove(k.begin(), k.end(), ' '), k.end());
+        if (k == "all" || k == "default" || k == "*") {
+            def = gib_val;
+        } else if (k == lower(device)) {
+            own     = gib_val;
+            has_own = true;
+        }
+    }
+    const double value = has_own ? own : def;
+    const uint64_t delta = static_cast<uint64_t>(std::fabs(value) * static_cast<double>(kGiB));
+    if (value > 0) return std::min(free_bytes, delta);
+    if (value < 0) return free_bytes > delta ? free_bytes - delta : 0;
+    return free_bytes;
 }
 
 bool parse_sigmas(const char* text, std::vector<float>& out) {
@@ -492,7 +558,7 @@ bsd_status_t bsd_info(bsd_engine_t* e, bsd_info_t* out) {
     out->sd_version   = sd_version();
     out->sd_commit    = sd_commit();
     out->system_info  = sd_get_system_info();
-    out->capabilities = BSD_CAP_CANCEL | BSD_CAP_MEMORY;
+    out->capabilities = BSD_CAP_CANCEL | BSD_CAP_MEMORY | BSD_CAP_AUTO_FIT;
     out->loaded       = e->ctx != nullptr ? 1 : 0;
     out->physical_cores = sd_get_num_physical_cores();
     out->n_threads      = e->n_threads;
@@ -508,6 +574,7 @@ bsd_status_t bsd_info(bsd_engine_t* e, bsd_info_t* out) {
         out->default_sample_method   = method < SAMPLE_METHOD_COUNT ? sd_sample_method_name(method) : nullptr;
         const scheduler_t scheduler  = sd_get_default_scheduler(e->ctx, method);
         out->default_scheduler       = scheduler < SCHEDULER_COUNT ? sd_scheduler_name(scheduler) : nullptr;
+        out->params_backend          = e->params_backend.empty() ? nullptr : e->params_backend.c_str();
     }
     return BSD_OK;
 }
@@ -523,7 +590,70 @@ bsd_status_t bsd_unload(bsd_engine_t* e) {
         free_sd_ctx(e->ctx);
         e->ctx = nullptr;
     }
+    e->params_backend.clear();
     return BSD_OK;
+}
+
+uint64_t bsd_load_bytes(const bsd_components_t* c, const char* params_backend) {
+    if (c == nullptr) {
+        return 0;
+    }
+    uint64_t kept = 0, largest_disk = 0;
+    for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
+        if (!is_set(c->paths[i])) {
+            continue;
+        }
+        const uint64_t bytes = source_bytes(c->paths[i]);
+        if (is_disk_part(params_backend, static_cast<bsd_component_t>(i))) {
+            largest_disk = std::max(largest_disk, bytes);
+        } else {
+            kept += bytes;
+        }
+    }
+    return kept + largest_disk + kLoadHeadroom;
+}
+
+int32_t bsd_fit_params_backend(const bsd_components_t* c, const char* params_backend, uint64_t available,
+                               uint64_t host_available, char* out, size_t out_size, uint64_t* needed) {
+    if (c == nullptr || out == nullptr || out_size == 0) {
+        return 0;
+    }
+    std::string plan = is_set(params_backend) ? params_backend : "";
+    auto fits        = [&](uint64_t* bytes) {
+        *bytes = bsd_load_bytes(c, plan.c_str());
+        return *bytes <= available + (uses_host(plan) ? host_available : 0);
+    };
+    uint64_t bytes = 0;
+    bool ok        = fits(&bytes);
+    // The text encoder runs once per prompt, so it goes to disk first. The diffusion model runs at
+    // each step, so it goes after the text encoder.
+    for (const char* module : {"te", "diffusion", "vae"}) {
+        if (ok) {
+            break;
+        }
+        bool named = false;
+        if (module_value(plan.c_str(), module, &named) == "disk" || named) {
+            continue;
+        }
+        bool present = false;
+        for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
+            present = present || (is_set(c->paths[i]) && std::strcmp(module_of(static_cast<bsd_component_t>(i)), module) == 0);
+        }
+        if (!present) {
+            continue;
+        }
+        plan += (plan.empty() ? "" : ",") + std::string(module) + "=disk";
+        ok = fits(&bytes);
+    }
+    if (needed != nullptr) {
+        *needed = bytes;
+    }
+    if (plan.size() + 1 > out_size) {
+        out[0] = '\0';
+        return 0;
+    }
+    std::memcpy(out, plan.c_str(), plan.size() + 1);
+    return ok ? 1 : 0;
 }
 
 bsd_status_t bsd_convert_parts(bsd_engine_t* e, const bsd_components_t* parts, const char* output,
@@ -646,16 +776,17 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
     if (e->generating) {
         return fail(e, BSD_ERR_BUSY, "A job is running. Cancel it before you load a model.");
     }
+    // A caller built with an older bsd.h has a smaller struct. The new fields stay 0.
     bsd_load_options_t opts{};
     if (o != nullptr) {
-        opts = *o;
+        std::memcpy(&opts, o, o->size > 0 && o->size < sizeof(opts) ? o->size : sizeof(opts));
+    }
+    if (opts.auto_fit < BSD_AUTO_FIT_DEFAULT || opts.auto_fit > BSD_AUTO_FIT_OFF) {
+        return fail(e, BSD_ERR_INVALID_ARGUMENT, "auto_fit must be default, on or off.");
     }
 
     // 1. Every part must exist.
-    uint64_t needed       = 0;
-    uint64_t largest_disk = 0;
-    uint64_t te_disk      = 0;
-    bool any              = false;
+    bool any = false;
     for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
         const char* path = c->paths[i];
         if (!is_set(path)) {
@@ -667,17 +798,7 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
             return fail(e, BSD_ERR_MISSING_FILE,
                         std::string("Model file not found for part '") + kComponentNames[i] + "': " + path);
         }
-        const uint64_t bytes = source_bytes(path);
-        if (!is_disk_part(opts.params_backend, static_cast<bsd_component_t>(i))) {
-            needed += bytes;
-        } else if (is_te_part(static_cast<bsd_component_t>(i))) {
-            te_disk += bytes;
-        } else {
-            largest_disk = std::max(largest_disk, bytes);
-        }
     }
-    // Kept parts stay loaded. A `disk` part loads and releases in turn, so only the largest one adds to them.
-    needed += std::max(te_disk, largest_disk);
     if (!any) {
         return fail(e, BSD_ERR_INVALID_ARGUMENT, "No model parts given.");
     }
@@ -685,7 +806,9 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
         return fail(e, BSD_ERR_INVALID_ARGUMENT, "Give a 'model' or a 'diffusion' part.");
     }
 
-    // 2. Free memory must be large enough for the weight files.
+    // 2. Free memory must be large enough for the weight files. With auto-fit on, put modules on
+    //    `disk` until they fit.
+    std::string params_backend = is_set(opts.params_backend) ? opts.params_backend : "";
     if (!opts.skip_memory_check) {
         bsd_memory_t mem{};
         bsd_memory(e, &mem);
@@ -700,23 +823,28 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
                 gpu_name = d.name;
             }
         }
-        const std::string pb = lower(is_set(opts.params_backend) ? opts.params_backend : "");
-        const bool uses_host = pb.find("cpu") != std::string::npos || pb.find("disk") != std::string::npos;
-        uint64_t available   = gpu_free;
-        std::string where    = gpu_name;
-        if (gpu_free == 0) {
-            available = cpu_free;
-            where     = "CPU";
-        } else if (uses_host && !kUnifiedMemory) {
-            // On unified memory the CPU and the GPU share one pool, so adding both would count it twice.
-            available += cpu_free;
-            where += " + CPU";
-        }
-        if (available > 0 && needed + kLoadHeadroom > available) {
-            return fail(e, BSD_ERR_OUT_OF_MEMORY,
-                        "Not enough memory to load this model. It needs about " + gib(needed + kLoadHeadroom) +
-                            ". " + gib(available) + " is free on " + where +
-                            ". Close other apps, use a smaller quantization, or put the text encoder on the CPU.");
+        uint64_t available      = gpu_free > 0 ? budget_bytes(opts.max_vram, gpu_name, gpu_free) : cpu_free;
+        // On unified memory the CPU and the GPU share one pool, so adding both would count it twice.
+        const uint64_t host     = gpu_free > 0 && !kUnifiedMemory ? cpu_free : 0;
+        const std::string where = gpu_free > 0 ? gpu_name : "CPU";
+        if (gpu_free > 0 || cpu_free > 0) {
+            uint64_t needed  = bsd_load_bytes(c, params_backend.c_str());
+            uint64_t can_use = available + (uses_host(params_backend) ? host : 0);
+            bool fits        = needed <= can_use;
+            if (!fits && opts.auto_fit == BSD_AUTO_FIT_ON) {
+                std::vector<char> plan(params_backend.size() + 64);
+                fits           = bsd_fit_params_backend(c, params_backend.c_str(), available, host, plan.data(),
+                                                        plan.size(), &needed) != 0;
+                params_backend = plan.data();
+                can_use        = available + (uses_host(params_backend) ? host : 0);
+            }
+            if (!fits) {
+                const std::string tried = opts.auto_fit == BSD_AUTO_FIT_ON ? " (also with params_backend '" + params_backend + "')" : "";
+                return fail(e, BSD_ERR_OUT_OF_MEMORY,
+                            "Not enough memory to load this model" + tried + ". It needs about " + gib(needed) + ". " +
+                                gib(can_use) + " is free on " + where + (host > 0 && uses_host(params_backend) ? " + CPU" : "") +
+                                ". Close other apps, use a smaller quantization, or set auto_fit to put parts on disk.");
+            }
         }
     }
 
@@ -755,7 +883,8 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
     p.eager_load                      = opts.eager_load != 0;
     p.tae_preview_only                = opts.tae_preview_only != 0;
     if (is_set(opts.backend)) p.backend = opts.backend;
-    if (is_set(opts.params_backend)) p.params_backend = opts.params_backend;
+    if (!params_backend.empty()) p.params_backend = params_backend.c_str();
+    if (opts.auto_fit != BSD_AUTO_FIT_DEFAULT) p.auto_fit = false;
     if (is_set(opts.max_vram)) p.max_vram = opts.max_vram;
     if (is_set(opts.flash_attn_mode)) p.flash_attn_mode = opts.flash_attn_mode;
     if (is_set(opts.model_args)) p.model_args = opts.model_args;
@@ -769,6 +898,7 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
 
     clear_recent_log(e);
     emit_stage(e, "load");
+    e->params_backend.clear();
     e->ctx = new_sd_ctx(&p);
     if (e->ctx == nullptr) {
         const std::string log = recent_log_text(e);
@@ -779,6 +909,7 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
                                                              : "The model failed to load.";
         return fail(e, st, msg, log);
     }
+    e->params_backend = params_backend;
     return BSD_OK;
 }
 

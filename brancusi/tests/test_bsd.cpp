@@ -3,8 +3,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
+#include <system_error>
 
 #include "bsd.h"
+
+namespace fs = std::filesystem;
 
 static int failures = 0;
 
@@ -152,12 +157,115 @@ static void test_load_errors() {
     bsd_destroy(e);
 }
 
+static constexpr uint64_t kMiB = 1024ull * 1024ull;
+static constexpr uint64_t kGiB = 1024ull * kMiB;
+
+// Sparse files of a set size. The plan reads only the file sizes.
+static std::string fake_file(const fs::path& dir, const char* name, uint64_t bytes) {
+    const fs::path path = dir / name;
+    std::FILE* f        = std::fopen(path.string().c_str(), "wb");
+    if (f != nullptr) std::fclose(f);
+    std::error_code ec;
+    fs::resize_file(path, bytes, ec);
+    return path.string();
+}
+
+static void test_auto_fit() {
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "bsd-tests-auto-fit";
+    fs::create_directories(dir, ec);
+    const std::string te = fake_file(dir, "te.gguf", 300 * kMiB);
+    const std::string dit = fake_file(dir, "dit.gguf", 700 * kMiB);
+    const std::string vae = fake_file(dir, "vae.safetensors", 30 * kMiB);
+
+    bsd_components_t c{};
+    c.size                           = sizeof(c);
+    c.paths[BSD_COMPONENT_LLM]       = te.c_str();
+    c.paths[BSD_COMPONENT_DIFFUSION] = dit.c_str();
+    c.paths[BSD_COMPONENT_VAE]       = vae.c_str();
+    const uint64_t head              = kGiB;
+
+    // Kept parts, plus the largest disk part, plus 1 GiB.
+    CHECK(bsd_load_bytes(&c, nullptr) == head + 1030 * kMiB);
+    CHECK(bsd_load_bytes(&c, "te=disk") == head + 1030 * kMiB);
+    CHECK(bsd_load_bytes(&c, "te=disk,diffusion=disk") == head + 730 * kMiB);
+    CHECK(bsd_load_bytes(&c, "disk") == head + 700 * kMiB);
+    CHECK(bsd_load_bytes(&c, "all=disk") == head + 700 * kMiB);
+    // A module entry overrides the default in any order, as in upstream.
+    CHECK(bsd_load_bytes(&c, "diffusion=MTL0,disk") == head + 1000 * kMiB);
+    CHECK(bsd_load_bytes(&c, "disk,diffusion=MTL0") == head + 1000 * kMiB);
+    CHECK(bsd_load_bytes(&c, "text_encoder=disk") == head + 1030 * kMiB);
+    CHECK(bsd_load_bytes(&c, "te=disk,DiT=disk") == head + 730 * kMiB);
+
+    char plan[128];
+    uint64_t needed = 0;
+    CHECK(bsd_fit_params_backend(&c, nullptr, head + 2 * kGiB, 0, plan, sizeof(plan), &needed) == 1);
+    CHECK(std::strcmp(plan, "") == 0 && needed == head + 1030 * kMiB);
+    CHECK(bsd_fit_params_backend(&c, nullptr, head + 800 * kMiB, 0, plan, sizeof(plan), &needed) == 1);
+    CHECK(std::strcmp(plan, "te=disk,diffusion=disk") == 0 && needed == head + 730 * kMiB);
+    CHECK(bsd_fit_params_backend(&c, nullptr, head + 710 * kMiB, 0, plan, sizeof(plan), &needed) == 1);
+    CHECK(std::strcmp(plan, "te=disk,diffusion=disk,vae=disk") == 0 && needed == head + 700 * kMiB);
+    CHECK(bsd_fit_params_backend(&c, nullptr, head + 100 * kMiB, 0, plan, sizeof(plan), &needed) == 0);
+    CHECK(std::strcmp(plan, "te=disk,diffusion=disk,vae=disk") == 0 && needed == head + 700 * kMiB);
+    // A module that the caller sets by name stays as it is.
+    CHECK(bsd_fit_params_backend(&c, "diffusion=MTL0", head + 800 * kMiB, 0, plan, sizeof(plan), &needed) == 0);
+    CHECK(std::strcmp(plan, "diffusion=MTL0,te=disk,vae=disk") == 0 && needed == head + 1000 * kMiB);
+    // Host memory counts when a module goes to disk (not on unified memory: the caller gives 0).
+    CHECK(bsd_fit_params_backend(&c, nullptr, head + 500 * kMiB, 300 * kMiB, plan, sizeof(plan), &needed) == 1);
+    CHECK(std::strcmp(plan, "te=disk,diffusion=disk") == 0);
+    CHECK(bsd_fit_params_backend(&c, nullptr, head, 0, plan, 8, &needed) == 0);
+    CHECK(plan[0] == '\0');
+
+    // No VAE part: the plan does not add vae=disk.
+    c.paths[BSD_COMPONENT_VAE] = nullptr;
+    CHECK(bsd_fit_params_backend(&c, nullptr, head, 0, plan, sizeof(plan), &needed) == 0);
+    CHECK(std::strcmp(plan, "te=disk,diffusion=disk") == 0);
+    c.paths[BSD_COMPONENT_VAE] = vae.c_str();
+
+    bsd_config_t config{};
+    config.size     = sizeof(config);
+    bsd_engine_t* e = bsd_create(&config);
+    CHECK(e != nullptr);
+    bsd_info_t info{};
+    CHECK(bsd_info(e, &info) == BSD_OK);
+    CHECK((info.capabilities & BSD_CAP_AUTO_FIT) != 0);
+    CHECK(info.params_backend == nullptr);
+
+    bsd_load_options_t o{};
+    o.size     = sizeof(o);
+    o.auto_fit = 7;
+    CHECK(bsd_load(e, &c, &o) == BSD_ERR_INVALID_ARGUMENT);
+
+    bsd_memory_t mem{};
+    bsd_memory(e, &mem);
+    bool gpu = false;
+    for (int i = 0; i < mem.device_count; i++) gpu = gpu || std::strcmp(mem.devices[i].type, "cpu") != 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    // Unified memory: host memory adds 0. A 0.1 GiB budget is less than the headroom, so no plan
+    // fits, and the load stops before upstream.
+    if (gpu) {
+        o.auto_fit = BSD_AUTO_FIT_ON;
+        o.max_vram = "0.1";
+        CHECK(bsd_load(e, &c, &o) == BSD_ERR_OUT_OF_MEMORY);
+        CHECK(std::strstr(bsd_last_error(e), "te=disk,diffusion=disk,vae=disk") != nullptr);
+        o.auto_fit = BSD_AUTO_FIT_DEFAULT;
+        CHECK(bsd_load(e, &c, &o) == BSD_ERR_OUT_OF_MEMORY);
+        CHECK(std::strstr(bsd_last_error(e), "te=disk") == nullptr);
+    }
+#else
+    (void)gpu;
+#endif
+    bsd_destroy(e);
+    fs::remove_all(dir, ec);
+}
+
 int main() {
     test_classify_failure();
     test_detect_stage();
     test_names();
     test_tables();
     test_load_errors();
+    test_auto_fit();
     if (failures == 0) std::printf("bsd-tests: all passed\n");
     return failures == 0 ? 0 : 1;
 }

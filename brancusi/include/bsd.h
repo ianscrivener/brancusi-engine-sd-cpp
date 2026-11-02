@@ -98,6 +98,14 @@ typedef enum {
 #define BSD_CAP_UPSCALE       (1ull << 5)
 #define BSD_CAP_SET_COMPONENT (1ull << 6) /* Layer 2 */
 #define BSD_CAP_RUN_STAGE     (1ull << 7) /* Layer 2 */
+#define BSD_CAP_AUTO_FIT      (1ull << 8) /* bsd_load_options_t.auto_fit */
+
+/* Values of bsd_load_options_t.auto_fit. */
+typedef enum {
+    BSD_AUTO_FIT_DEFAULT = 0, /* Upstream auto-fit: on when params_backend is not set. No engine plan. */
+    BSD_AUTO_FIT_ON,          /* Engine plan: add `<module>=disk` entries until the parts fit. Upstream auto-fit off. */
+    BSD_AUTO_FIT_OFF,         /* Upstream auto-fit off. No engine plan. */
+} bsd_auto_fit_t;
 
 typedef struct {
     uint32_t size;
@@ -122,6 +130,8 @@ typedef struct {
     int32_t eager_load;          /* 0 or 1. Load all weights now, not on first use. */
     int32_t tae_preview_only;    /* 0 or 1. Use TAESD for previews only. */
     int32_t skip_memory_check;   /* 0 or 1. Do not compare file sizes with free memory before the load. */
+    /* Added after the first release. */
+    int32_t auto_fit;            /* bsd_auto_fit_t. */
 } bsd_load_options_t;
 
 typedef struct {
@@ -207,6 +217,8 @@ typedef struct {
     int32_t n_threads;
     const char* default_sample_method; /* NULL when no model is loaded. */
     const char* default_scheduler;     /* NULL when no model is loaded. */
+    /* Params backend of the loaded model: as given, or as auto-fit set it. NULL when not set. */
+    const char* params_backend;
 } bsd_info_t;
 
 /* Name tables of the engine. See bsd_table_name(). */
@@ -311,6 +323,22 @@ const char* bsd_content_name(bsd_content_t c);
 int32_t bsd_table_size(bsd_table_t table);
 /* One name of a table. NULL if index is out of range. "" for an unused slot. */
 const char* bsd_table_name(bsd_table_t table, int32_t index);
+/*
+ * Memory needed to load the given parts with this params_backend: the kept parts, plus the
+ * largest `disk` part (a `disk` part loads and releases in turn), plus 1 GiB headroom.
+ * A missing part file counts as 0 bytes.
+ */
+uint64_t bsd_load_bytes(const bsd_components_t* c, const char* params_backend);
+/*
+ * The auto-fit plan of bsd_load. Adds `te=disk`, then `diffusion=disk`, then `vae=disk` to
+ * params_backend until bsd_load_bytes() is not more than the available memory. It does not change
+ * a module that params_backend sets by name. `available` is the free memory of the main device.
+ * `host_available` is added when the plan puts a module on `disk` or `cpu` (0 on unified memory).
+ * Writes the plan to `out` (always NUL-terminated) and the bytes needed to *needed (if not NULL).
+ * Returns 1 if the plan fits, 0 if it does not fit or `out` is too small.
+ */
+int32_t bsd_fit_params_backend(const bsd_components_t* c, const char* params_backend, uint64_t available,
+                               uint64_t host_available, char* out, size_t out_size, uint64_t* needed);
 /* Map recent upstream log text to a status. Used when upstream gives no other signal. */
 bsd_status_t bsd_classify_failure(const char* log_text);
 /*

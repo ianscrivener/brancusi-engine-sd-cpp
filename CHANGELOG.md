@@ -112,3 +112,16 @@ Two CodeRabbit fixes. Each step lists the file, the cause, the change and the te
 20:44 Monday 2 November 2026
 
 **Version 0.1.2.** Release build.
+
+---
+21:40 Monday 2 November 2026
+
+**Step 13. `peak_bytes` in the `done` reply** ([main.cpp](brancusi/host/main.cpp))
+- Cause: `peak_mib` used the device memory only at stage changes and steps. It did not see the peak of a lazy load or a VAE decode.
+- Change: a thread reads the main device memory (`ggml_backend_dev_memory`, Layer 1) each 50 ms during the job. `done` has the new field `peak_bytes`. `peak_mib` stays.
+- Test: Z-Image Turbo, 512x512, 8 steps: `peak_bytes` 12713984000 with all parts kept, 7492567040 with `te=disk,diffusion=disk`.
+
+**Step 14. `auto_fit` load option** ([bsd.h](brancusi/include/bsd.h), [l1_engine.cpp](brancusi/src/l1_engine.cpp), [main.cpp](brancusi/host/main.cpp))
+- Cause: when the model did not fit, the load stopped with `out_of_memory`. Upstream auto-fit can put a part in CPU memory, which is a second copy on unified memory.
+- Change: `auto_fit` `true` adds `te=disk`, then `diffusion=disk`, then `vae=disk` until the pre-load memory check passes. `true` and `false` set upstream auto-fit off. `loaded` and `info` have `params_backend`. The pre-load check uses a `max_vram` budget. A module entry in `params_backend` now overrides the default in any order, as in upstream. `hello` lists `auto_fit` and `peak_bytes` in `capabilities`.
+- Test: `bsd-tests` checks the plan with sparse files. A load with `auto_fit` and `max_vram` 9 chose `te=disk,diffusion=disk` and made the image.

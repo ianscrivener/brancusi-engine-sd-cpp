@@ -237,6 +237,7 @@ json capabilities_json(uint64_t caps) {
         {BSD_CAP_IMAGE, "image"},     {BSD_CAP_VIDEO, "video"},           {BSD_CAP_CANCEL, "cancel"},
         {BSD_CAP_PREVIEW, "preview"}, {BSD_CAP_MEMORY, "memory"},         {BSD_CAP_UPSCALE, "upscale"},
         {BSD_CAP_SET_COMPONENT, "set_component"}, {BSD_CAP_RUN_STAGE, "run_stage"},
+        {BSD_CAP_AUTO_FIT, "auto_fit"},
     };
     for (const auto& [flag, name] : names) {
         if (caps & flag) out.push_back(name);
@@ -249,7 +250,7 @@ json info_json() {
     info.size = sizeof(info);
     bsd_info(g.engine, &info);
     json caps = capabilities_json(info.capabilities);
-    for (const char* command : {"convert", "inspect", "schedulers", "hardware"}) caps.push_back(command);
+    for (const char* command : {"convert", "inspect", "schedulers", "hardware", "peak_bytes"}) caps.push_back(command);
     json m = {{"version", BRANCUSI_ENGINE_VERSION},
               {"bsd_api_version", info.api_version},
               {"sd_version", info.sd_version ? info.sd_version : ""},
@@ -264,6 +265,7 @@ json info_json() {
         m["default_scheduler"]     = info.default_scheduler ? info.default_scheduler : "";
         m["image_generation"]      = (info.capabilities & BSD_CAP_IMAGE) != 0;
         m["video_generation"]      = (info.capabilities & BSD_CAP_VIDEO) != 0;
+        m["params_backend"]        = info.params_backend ? info.params_backend : "";
     }
     return m;
 }
@@ -376,6 +378,69 @@ std::string preview_jpeg(const bsd_image_t& img, int max_px) {
     return bytes;
 }
 
+// The main GPU (the first one), or the CPU if there is no GPU. NULL if no device reports memory.
+const bsd_device_memory_t* main_device(const bsd_memory_t& mem) {
+    const bsd_device_memory_t* best = nullptr;
+    for (int i = 0; i < mem.device_count; i++) {
+        const auto& d = mem.devices[i];
+        if (d.total_bytes == 0) continue;
+        const bool gpu = std::strcmp(d.type, "cpu") != 0;
+        if (best == nullptr || (gpu && std::strcmp(best->type, "cpu") == 0)) best = &d;
+    }
+    return best;
+}
+
+// Reads the main device memory at a short interval while a job runs. The events come only at
+// stage changes and steps, so they can miss the peak of a lazy load or a VAE decode.
+class PeakSampler {
+public:
+    PeakSampler() : thread_([this] { run(); }) {}
+
+    ~PeakSampler() { stop(); }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    uint64_t peak_bytes() const { return peak_.load(); }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        do {
+            lock.unlock();
+            sample();
+            lock.lock();
+        } while (!cv_.wait_for(lock, kInterval, [this] { return stopping_; }));
+        lock.unlock();
+        sample();
+    }
+
+    void sample() {
+        bsd_memory_t mem{};
+        mem.size = sizeof(mem);
+        bsd_memory(g.engine, &mem);
+        const bsd_device_memory_t* d = main_device(mem);
+        if (d == nullptr) return;
+        const uint64_t used = d->total_bytes > d->free_bytes ? d->total_bytes - d->free_bytes : 0;
+        uint64_t prev       = peak_.load();
+        while (used > prev && !peak_.compare_exchange_weak(prev, used)) {
+        }
+    }
+
+    static constexpr auto kInterval = std::chrono::milliseconds(50);
+    std::atomic<uint64_t> peak_{0};
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stopping_ = false;
+    std::thread thread_;
+};
+
 // Send device memory for the main GPU (or the CPU). Track the lowest free memory for peak use.
 void send_memory(bool force) {
     const auto now = Clock::now();
@@ -384,13 +449,7 @@ void send_memory(bool force) {
     bsd_memory_t mem{};
     mem.size = sizeof(mem);
     bsd_memory(g.engine, &mem);
-    const bsd_device_memory_t* best = nullptr;
-    for (int i = 0; i < mem.device_count; i++) {
-        const auto& d = mem.devices[i];
-        if (d.total_bytes == 0) continue;
-        const bool gpu = std::strcmp(d.type, "cpu") != 0;
-        if (best == nullptr || (gpu && std::strcmp(best->type, "cpu") == 0)) best = &d;
-    }
+    const bsd_device_memory_t* best = main_device(mem);
     if (best == nullptr) return;
     g.stats.min_free_bytes = std::min<uint64_t>(g.stats.min_free_bytes, best->free_bytes);
     g.stats.total_bytes    = best->total_bytes;
@@ -557,6 +616,19 @@ void do_load(const std::string& id, const json& cmd) {
     opts.eager_load        = o.value("eager_load", false) ? 1 : 0;
     opts.tae_preview_only  = o.value("tae_preview_only", false) ? 1 : 0;
     opts.skip_memory_check = o.value("skip_memory_check", false) ? 1 : 0;
+    opts.auto_fit          = BSD_AUTO_FIT_DEFAULT;
+    if (o.contains("auto_fit") && !o["auto_fit"].is_null()) {
+        const json& af = o["auto_fit"];
+        if (af.is_boolean()) {
+            opts.auto_fit = af.get<bool>() ? BSD_AUTO_FIT_ON : BSD_AUTO_FIT_OFF;
+        } else if (af.is_string() && (af == "on" || af == "off")) {
+            opts.auto_fit = af == "on" ? BSD_AUTO_FIT_ON : BSD_AUTO_FIT_OFF;
+        } else {
+            g.writer->send(error_message(id, BSD_ERR_INVALID_ARGUMENT, "auto_fit must be true, false, \"on\" or \"off\"."));
+            set_current("", "");
+            return;
+        }
+    }
 
     const auto start        = std::chrono::steady_clock::now();
     const bsd_status_t st   = bsd_load(g.engine, &components, &opts);
@@ -609,7 +681,9 @@ void do_generate(const std::string& id, const json& cmd) {
 
     const auto start      = std::chrono::steady_clock::now();
     bsd_result_t* result  = nullptr;
+    PeakSampler sampler;
     const bsd_status_t st = bsd_generate_image(g.engine, &params, &result);
+    sampler.stop();
     if (st != BSD_OK) {
         g.writer->send(engine_error(id, st, job));
         set_current("", "");
@@ -635,8 +709,13 @@ void do_generate(const std::string& id, const json& cmd) {
     json timings        = g.stats.timings;
     timings["total_ms"] = ms_since(start);
     json done = {{"id", id}, {"event", "done"}, {"job", job}, {"outputs", outputs}, {"timings", timings}};
-    if (g.stats.min_free_bytes != UINT64_MAX) {
-        done["peak_mib"] = (g.stats.total_bytes - g.stats.min_free_bytes) / (1024 * 1024);
+    uint64_t peak = sampler.peak_bytes();
+    if (g.stats.min_free_bytes != UINT64_MAX && g.stats.total_bytes > g.stats.min_free_bytes) {
+        peak = std::max<uint64_t>(peak, g.stats.total_bytes - g.stats.min_free_bytes);
+    }
+    if (peak > 0) {
+        done["peak_bytes"] = peak;
+        done["peak_mib"]   = peak / (1024 * 1024);
     }
     g.writer->send(done);
     set_current("", "");

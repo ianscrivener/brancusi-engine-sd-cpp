@@ -81,7 +81,15 @@ Commands (core to engine):
 
 Part names are the `bsd_component_t` names: `model`, `diffusion`, `vae`, `taesd`, `llm`, `t5xxl`, `clip_l` and others.
 
-`load` options: `backend`, `params_backend`, `max_vram`, `flash_attn`, `model_args`, `weight_type`, `mmap`, `eager_load`, `tae_preview_only`, `skip_memory_check`.
+`load` options: `backend`, `params_backend`, `max_vram`, `flash_attn`, `model_args`, `weight_type`, `mmap`, `eager_load`, `tae_preview_only`, `skip_memory_check`, `auto_fit`.
+
+`auto_fit` (`true`, `false`, `"on"` or `"off"`):
+
+- Not set: upstream auto-fit. It is on when `params_backend` is not set. On a Mac, it can put a part in CPU memory, which is a second copy in the same memory.
+- `true`: the engine makes the plan. If the model does not fit (see [Memory check](#memory-check)), the engine adds `te=disk`, then `diffusion=disk`, then `vae=disk` to `params_backend` until it fits. It does not change a module that `params_backend` sets by name. Upstream auto-fit is off. If the model does not fit with all modules on `disk`, the load stops with `out_of_memory`.
+- `false`: upstream auto-fit is off. The engine does not change `params_backend`.
+
+The `loaded` reply has `params_backend`: the value that the load used, as given or as auto-fit set it.
 
 `generate` params: `prompt`, `negative_prompt`, `width`, `height`, `steps`, `seed`, `cfg_scale`, `sample_method`, `scheduler`, `sigmas` (a list, or the preset `qwen-image-2.1-turbo`), `batch_count`, `flow_shift`.
 
@@ -92,13 +100,22 @@ Events during a job:
 - `stage`: `load`, `encode_prompt`, `sample` or `decode`. Layer 1 finds the stage in the upstream log text (`bsd_detect_stage`).
 - `progress`: `step`, `steps`, `sec_per_step`. Upstream also sends tensor loading as progress. Use it as a sampling step only in the `sample` stage.
 - `metrics`: device memory (`device`, `used_mib`, `free_mib`) at each stage change and at most once each second, or one stage duration (`timings`).
-- `loaded`: the `info` fields plus `ms`, `default_sample_method`, `default_scheduler`, `image_generation` and `video_generation`. `capabilities` has `image` and `video` when the model supports them.
-- `done`: `outputs`, `timings` (`load_ms`, `encode_prompt_ms`, `sample_ms`, `decode_ms`, `total_ms`) and `peak_mib`.
+- `loaded`: the `info` fields plus `ms`, `default_sample_method`, `default_scheduler`, `image_generation`, `video_generation` and `params_backend`. `capabilities` has `image` and `video` when the model supports them.
+- `done`: `outputs`, `timings` (`load_ms`, `encode_prompt_ms`, `sample_ms`, `decode_ms`, `total_ms`), `peak_bytes` and `peak_mib`.
+
+`peak_bytes` is the peak memory in use on the main device (the first GPU, or the CPU) during the job. It includes the weights that stay loaded. A thread reads the device memory (`ggml_backend_dev_memory`) each 50 ms while the job runs. On Metal, the value is the Metal memory of the engine process. The value cannot be more than the Metal working-set limit. `peak_mib` is the same value in MiB.
+
+Sample (Z-Image Turbo, 512x512, 8 steps, M4 Max):
+
+```json
+{"event":"loaded","params_backend":"te=disk,diffusion=disk","ms":160,...}
+{"event":"done","peak_bytes":7492567040,"peak_mib":7145,"timings":{"load_ms":5180,"encode_prompt_ms":4260,"sample_ms":20800,"decode_ms":2090,"total_ms":27189},...}
+```
 
 The engine sends `hello` first. It has `version`, `bsd_api_version`, `sd_commit`, `capabilities` and `devices`. The `info` reply has the same fields.
 
 - `version`: the engine version and the upstream base commit. A release build sends `0.1.1+sd.37bc88b`. Other builds send `0.1.1-dev.<commits>.g<commit>[.dirty]+sd.37bc88b`, so the app can see a local build. `BRANCUSI_VERSION` and `BRANCUSI_SD_BASE` in `brancusi/CMakeLists.txt` set the values. CMake reads git at configure time, so run the configure step again after a commit.
-- `capabilities`: the model flags (`image`, `video`, `cancel` and others) and the commands `convert`, `inspect`, `schedulers` and `hardware`.
+- `capabilities`: the model flags (`image`, `video`, `cancel` and others), the `load` option `auto_fit`, the commands `convert`, `inspect`, `schedulers` and `hardware`, and `peak_bytes` (the `done` field).
 
 Each reply and each event for a command has the same `id`. Job events also have `job`.
 
@@ -106,4 +123,6 @@ Error codes: `out_of_memory`, `missing_file`, `bad_model`, `cancelled`, `unsuppo
 
 ## Memory check
 
-Before a load, the engine adds the file sizes of all parts and adds 1 GiB. It compares the sum with the free memory of the largest GPU device. If `params_backend` puts a module on `cpu` or `disk`, the engine also adds free CPU memory. If the sum is larger, the load stops with `out_of_memory`. Set `skip_memory_check` to load anyway.
+Before a load, the engine adds the file sizes of the kept parts, the size of the largest `disk` part and 1 GiB. A `disk` part loads and releases in turn, so only the largest one counts. The engine compares the sum with the free memory of the largest GPU device. If `max_vram` gives a budget for that device (`<GiB>`, `all=<GiB>` or `<device>=<GiB>`), the engine uses the smaller value. A negative budget is the free memory less that many GiB. If `params_backend` puts a module on `cpu` or `disk`, the engine also adds free CPU memory, but not on unified memory (Apple Silicon). If the sum is larger, the load stops with `out_of_memory`, or `auto_fit` puts modules on `disk`. Set `skip_memory_check` to load anyway.
+
+`bsd_load_bytes()` and `bsd_fit_params_backend()` in `bsd.h` give the same sum and plan to a host or a test.
