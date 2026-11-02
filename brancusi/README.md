@@ -37,7 +37,7 @@ For other backends, use the upstream CMake options (`SD_CUDA`, `SD_VULKAN`, `SD_
 
 The workflow `.github/workflows/brancusi-engine.yml` builds `brancusi-engine` for each variant in its matrix. It runs `bsd-tests` on the Metal and CPU builds. Now the matrix has only `darwin-arm64-metal`. To make CI faster, the other variants have comment marks.
 
-To make a release, push a tag `brancusi-v<version>`, for example `brancusi-v0.1.1`. The tag must match `BRANCUSI_VERSION` in `brancusi/CMakeLists.txt`. The release gets one zip for each variant and a `manifest.json` with the file, size and SHA-256 of each zip. Copy these values into `engine.json` in `brancusi-desktop`.
+To make a release, run `just bump`. It adds 1 to the patch version (`just bump minor` or `just bump major` for the other parts), adds a CHANGELOG entry, commits, pushes, pushes the tag and watches CI. The tree must be clean. Or push a tag `brancusi-v<version>` by hand, for example `brancusi-v0.1.1`. The tag must match `BRANCUSI_VERSION` in `brancusi/CMakeLists.txt`. The release gets one zip for each variant and a `manifest.json` with the file, size and SHA-256 of each zip. Copy these values into `engine.json` in `brancusi-desktop`.
 
 The upstream `.gitignore` ignores `tests/`. To add a new file in `brancusi/tests/`, use `git add -f`.
 
