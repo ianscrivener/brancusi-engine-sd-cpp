@@ -94,3 +94,16 @@ Two CodeRabbit fixes. Each step lists the file, the cause, the change and the te
 - Cause: `actions/checkout@v4` and `actions/upload-artifact@v4` target Node.js 20, which GitHub deprecates. Each CI run showed a warning.
 - Change: `checkout` v7, `upload-artifact` v7, `download-artifact` v8. These are the latest major versions. I did not change `Jimver/cuda-toolkit`, because only the CUDA variant uses it and that variant is off.
 - Test: see the CI run for the commit that holds this entry.
+---
+19:56 Monday 2 November 2026
+
+**Version 0.1.1.** The `hello` and `info` replies now tell a release build from a local build.
+
+**Step 11. Engine version in `hello` and `info`** ([main.cpp](brancusi/host/main.cpp), [CMakeLists.txt](brancusi/CMakeLists.txt))
+- Cause: the replies had only `sd_version` and `sd_commit`. The release and a local build both sent `9008a3a`, so the app could not tell them apart.
+- Change: a new `version` field. `BRANCUSI_VERSION` (0.1.1) and `BRANCUSI_SD_BASE` (the upstream base commit, `37bc88b`) in `brancusi/CMakeLists.txt` set it. A build at the clean tag `brancusi-v0.1.1` sends `0.1.1+sd.37bc88b`. Other builds send a git-describe value, for example `0.1.1-dev.4.g2203686.dirty+sd.37bc88b`.
+- Test: `info` on a local build returns the dev value.
+
+**Step 12. Commands in `capabilities`** ([main.cpp](brancusi/host/main.cpp))
+- Change: `capabilities` now also has `convert`, `inspect`, `schedulers` and `hardware`.
+- Test: `hello` and `info` list the four commands. `bsd-tests` passes.

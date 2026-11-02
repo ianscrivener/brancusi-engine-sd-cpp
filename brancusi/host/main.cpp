@@ -37,6 +37,10 @@
 #include "stb_image_write.h"
 
 #include "bsd.h"
+
+#ifndef BRANCUSI_ENGINE_VERSION
+#define BRANCUSI_ENGINE_VERSION "unknown"
+#endif
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -244,11 +248,14 @@ json info_json() {
     bsd_info_t info{};
     info.size = sizeof(info);
     bsd_info(g.engine, &info);
-    json m = {{"bsd_api_version", info.api_version},
+    json caps = capabilities_json(info.capabilities);
+    for (const char* command : {"convert", "inspect", "schedulers", "hardware"}) caps.push_back(command);
+    json m = {{"version", BRANCUSI_ENGINE_VERSION},
+              {"bsd_api_version", info.api_version},
               {"sd_version", info.sd_version ? info.sd_version : ""},
               {"sd_commit", info.sd_commit ? info.sd_commit : ""},
               {"system_info", info.system_info ? info.system_info : ""},
-              {"capabilities", capabilities_json(info.capabilities)},
+              {"capabilities", caps},
               {"loaded", info.loaded != 0},
               {"devices", devices_json()}};
     if (info.model_version) m["model_version"] = info.model_version;

@@ -37,7 +37,7 @@ For other backends, use the upstream CMake options (`SD_CUDA`, `SD_VULKAN`, `SD_
 
 The workflow `.github/workflows/brancusi-engine.yml` builds `brancusi-engine` for each variant in its matrix. It runs `bsd-tests` on the Metal and CPU builds. Now the matrix has only `darwin-arm64-metal`. To make CI faster, the other variants have comment marks.
 
-To make a release, push a tag `brancusi-v<version>`, for example `brancusi-v0.1.0`. The release gets one zip for each variant and a `manifest.json` with the file, size and SHA-256 of each zip. Copy these values into `engine.json` in `brancusi-desktop`.
+To make a release, push a tag `brancusi-v<version>`, for example `brancusi-v0.1.1`. The tag must match `BRANCUSI_VERSION` in `brancusi/CMakeLists.txt`. The release gets one zip for each variant and a `manifest.json` with the file, size and SHA-256 of each zip. Copy these values into `engine.json` in `brancusi-desktop`.
 
 The upstream `.gitignore` ignores `tests/`. To add a new file in `brancusi/tests/`, use `git add -f`.
 
@@ -95,7 +95,10 @@ Events during a job:
 - `loaded`: the `info` fields plus `ms`, `default_sample_method`, `default_scheduler`, `image_generation` and `video_generation`. `capabilities` has `image` and `video` when the model supports them.
 - `done`: `outputs`, `timings` (`load_ms`, `encode_prompt_ms`, `sample_ms`, `decode_ms`, `total_ms`) and `peak_mib`.
 
-The engine sends `hello` first. It has `bsd_api_version`, `sd_commit`, `capabilities` and `devices`.
+The engine sends `hello` first. It has `version`, `bsd_api_version`, `sd_commit`, `capabilities` and `devices`. The `info` reply has the same fields.
+
+- `version`: the engine version and the upstream base commit. A release build sends `0.1.1+sd.37bc88b`. Other builds send `0.1.1-dev.<commits>.g<commit>[.dirty]+sd.37bc88b`, so the app can see a local build. `BRANCUSI_VERSION` and `BRANCUSI_SD_BASE` in `brancusi/CMakeLists.txt` set the values. CMake reads git at configure time, so run the configure step again after a commit.
+- `capabilities`: the model flags (`image`, `video`, `cancel` and others) and the commands `convert`, `inspect`, `schedulers` and `hardware`.
 
 Each reply and each event for a command has the same `id`. Job events also have `job`.
 
