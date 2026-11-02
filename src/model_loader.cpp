@@ -448,6 +448,11 @@ SDVersion ModelLoader::get_sd_version() const {
         return VERSION_FLUX3;
     }
 
+    if (tensor_storage_map.count("model.diffusion_model.mode_blocks.image.0.attn.to_q.weight") ||
+        tensor_storage_map.count("model.diffusion_model.early_stream_modulations.image.linear.weight")) {
+        return VERSION_FLUX3;
+    }
+
     if (tensor_storage_map.count("model.diffusion_model.video_embedder.weight") &&
         tensor_storage_map.count("model.diffusion_model.shared_block_modulation.weight")) {
         return VERSION_MOSS_IMAGE;

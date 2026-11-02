@@ -201,6 +201,10 @@ std::string convert_cond_stage_model_name(std::string name, std::string prefix, 
             const std::string language_prefix = "llm.model.language_model.";
             if (starts_with(name, language_prefix)) {
                 name = "llm.model." + name.substr(language_prefix.size());
+            } else if (starts_with(name, "llm.language_model.model.")) {
+                name = "llm.model." + name.substr(std::string("llm.language_model.model.").size());
+            } else if (starts_with(name, "llm.language_model.")) {
+                name = "llm.model." + name.substr(std::string("llm.language_model.").size());
             }
         }
     } else {

@@ -43,6 +43,11 @@ static ggml_type get_export_tensor_type(ModelLoader& model_loader,
     ggml_type tensor_type   = tensor_storage.type;
     ggml_type dst_type      = type;
 
+    if (tensor_type == GGML_TYPE_I8 || tensor_type == GGML_TYPE_I16 || tensor_type == GGML_TYPE_I32 ||
+        tensor_type == GGML_TYPE_I64) {
+        return tensor_type;
+    }
+
     for (const auto& tensor_type_rule : tensor_type_rules) {
         std::regex pattern(tensor_type_rule.first);
         if (std::regex_search(name, pattern)) {

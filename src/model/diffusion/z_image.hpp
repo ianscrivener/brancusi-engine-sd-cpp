@@ -69,8 +69,12 @@ namespace ZImage {
                     config.hidden_size  = tensor_storage.ne[1];
                 } else if (ends_with(name, "layers.0.attention.q_norm.weight") && tensor_storage.n_dims == 1) {
                     detected_head_dim = tensor_storage.ne[0];
-                } else if (ends_with(name, "layers.0.attention.qkv.weight") && tensor_storage.n_dims == 2) {
-                    detected_qkv_dim = tensor_storage.ne[1];
+                } else if ((ends_with(name, "layers.0.attention.qkv.weight") ||
+                            ends_with(name, "layers.0.attention.qkv.weight.1") ||
+                            ends_with(name, "layers.0.attention.qkv.weight.2")) &&
+                           tensor_storage.n_dims == 2) {
+                    // Diffusers files give q, k and v as separate parts that the loader merges.
+                    detected_qkv_dim += tensor_storage.ne[1];
                 } else if (ends_with(name, "final_layer.linear.weight") && tensor_storage.n_dims == 2) {
                     int64_t patch_area  = config.patch_size * config.patch_size;
                     config.out_channels = tensor_storage.ne[1] / patch_area;

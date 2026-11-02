@@ -152,10 +152,26 @@ ggml_tensor* ggml_ext_silu_act(ggml_context* ctx, ggml_tensor* x, bool gate_firs
     return x;
 }
 
+// The Metal group-norm kernel ignores ne[3], so a batch above 1 leaves the later images unnormalized.
+// The channels of one image are contiguous, so one image with `ngrp` groups equals N images folded into
+// one tensor with N * ngrp groups.
+static ggml_tensor* ggml_ext_group_norm_folded(ggml_context* ctx, ggml_tensor* x, int num_groups, float eps) {
+    const int64_t batch = x->ne[3];
+    if (batch <= 1) {
+        return ggml_group_norm(ctx, x, num_groups, eps);
+    }
+    if (!ggml_is_contiguous(x)) {
+        x = ggml_cont(ctx, x);
+    }
+    ggml_tensor* folded = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1], x->ne[2] * batch, 1);
+    folded              = ggml_group_norm(ctx, folded, num_groups * static_cast<int>(batch), eps);
+    return ggml_reshape_4d(ctx, folded, x->ne[0], x->ne[1], x->ne[2], batch);
+}
+
 ggml_tensor* ggml_ext_group_norm_32(ggml_context* ctx,
                                     ggml_tensor* a) {
     const float eps = 1e-6f;  // default eps parameter
-    return ggml_group_norm(ctx, a, 32, eps);
+    return ggml_ext_group_norm_folded(ctx, a, 32, eps);
 }
 
 static bool ggml_ext_is_padded_1d(const ggml_tensor* x) {
@@ -837,7 +853,7 @@ ggml_tensor* ggml_ext_group_norm(ggml_context* ctx,
         b = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);
     }
 
-    x = ggml_group_norm(ctx, x, num_groups, eps);
+    x = ggml_ext_group_norm_folded(ctx, x, num_groups, eps);
     if (w != nullptr && b != nullptr) {
         x = ggml_mul_inplace(ctx, x, w);
         x = ggml_add_inplace(ctx, x, b);

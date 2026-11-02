@@ -47,6 +47,11 @@ constexpr size_t kRecentLogLines = 40;
 constexpr uint64_t kGiB          = 1024ull * 1024ull * 1024ull;
 // Headroom for compute buffers on top of the weight files.
 constexpr uint64_t kLoadHeadroom = kGiB;
+#if defined(__APPLE__) && defined(__aarch64__)
+constexpr bool kUnifiedMemory = true;
+#else
+constexpr bool kUnifiedMemory = false;
+#endif
 
 const char* const kComponentNames[BSD_COMPONENT_COUNT] = {
     "model", "diffusion", "high_noise_diffusion", "uncond_diffusion", "vae", "taesd", "clip_l",
@@ -226,6 +231,32 @@ const char* device_type_name(enum ggml_backend_dev_type type) {
 std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+bool is_te_part(bsd_component_t part) {
+    return part == BSD_COMPONENT_CLIP_L || part == BSD_COMPONENT_CLIP_G || part == BSD_COMPONENT_CLIP_VISION ||
+           part == BSD_COMPONENT_T5XXL || part == BSD_COMPONENT_LLM || part == BSD_COMPONENT_LLM_VISION;
+}
+
+// True when `params_backend` puts the module of this part on `disk`. Upstream syntax: a bare
+// `disk`, `all=disk`, or per-module entries such as `te=disk,vae=disk`.
+bool is_disk_part(const char* params_backend, bsd_component_t part) {
+    if (!is_set(params_backend)) {
+        return false;
+    }
+    const char* module = is_te_part(part) ? "te" : (part == BSD_COMPONENT_VAE || part == BSD_COMPONENT_TAESD) ? "vae" : "diffusion";
+    bool disk = false;
+    std::stringstream entries(lower(params_backend));
+    std::string entry;
+    while (std::getline(entries, entry, ',')) {
+        const size_t eq        = entry.find('=');
+        const std::string key  = eq == std::string::npos ? "all" : entry.substr(0, eq);
+        const std::string val  = eq == std::string::npos ? entry : entry.substr(eq + 1);
+        if (key == "all" || key == module) {
+            disk = val == "disk";
+        }
+    }
+    return disk;
 }
 
 bool parse_sigmas(const char* text, std::vector<float>& out) {
@@ -536,10 +567,17 @@ bsd_status_t bsd_convert_parts(bsd_engine_t* e, const bsd_components_t* parts, c
     auto path = [&](bsd_component_t which) { return is_set(parts->paths[which]) ? parts->paths[which] : nullptr; };
     clear_recent_log(e);
     emit_stage(e, "convert");
-    const bool ok = convert_with_components(path(BSD_COMPONENT_MODEL), path(BSD_COMPONENT_CLIP_L), path(BSD_COMPONENT_CLIP_G),
-                                            path(BSD_COMPONENT_T5XXL), path(BSD_COMPONENT_DIFFUSION), path(BSD_COMPONENT_VAE),
-                                            output, out_type, is_set(rules) ? rules : "", convert_name != 0, e->n_threads,
-                                            nullptr, 0);
+    bool ok = false;
+    try {
+        ok = convert_with_components(path(BSD_COMPONENT_MODEL), path(BSD_COMPONENT_CLIP_L), path(BSD_COMPONENT_CLIP_G),
+                                     path(BSD_COMPONENT_T5XXL), path(BSD_COMPONENT_DIFFUSION), path(BSD_COMPONENT_VAE),
+                                     output, out_type, is_set(rules) ? rules : "", convert_name != 0, e->n_threads,
+                                     nullptr, 0);
+    } catch (const std::exception& ex) {
+        return fail(e, BSD_ERR_BAD_MODEL, "The conversion failed.", ex.what());
+    } catch (...) {
+        return fail(e, BSD_ERR_BAD_MODEL, "The conversion failed.", "Unknown exception.");
+    }
     if (!ok) {
         const std::string log = recent_log_text(e);
         const bsd_status_t st = bsd_classify_failure(log.c_str());
@@ -614,8 +652,10 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
     }
 
     // 1. Every part must exist.
-    uint64_t needed = 0;
-    bool any        = false;
+    uint64_t needed       = 0;
+    uint64_t largest_disk = 0;
+    uint64_t te_disk      = 0;
+    bool any              = false;
     for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
         const char* path = c->paths[i];
         if (!is_set(path)) {
@@ -627,8 +667,17 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
             return fail(e, BSD_ERR_MISSING_FILE,
                         std::string("Model file not found for part '") + kComponentNames[i] + "': " + path);
         }
-        needed += source_bytes(path);
+        const uint64_t bytes = source_bytes(path);
+        if (!is_disk_part(opts.params_backend, static_cast<bsd_component_t>(i))) {
+            needed += bytes;
+        } else if (is_te_part(static_cast<bsd_component_t>(i))) {
+            // The text encoder runs first and is released before sampling, so it does not add to the kept parts.
+            te_disk += bytes;
+        } else {
+            largest_disk = std::max(largest_disk, bytes);
+        }
     }
+    needed = std::max(needed, te_disk) + largest_disk;
     if (!any) {
         return fail(e, BSD_ERR_INVALID_ARGUMENT, "No model parts given.");
     }
@@ -658,7 +707,8 @@ bsd_status_t bsd_load(bsd_engine_t* e, const bsd_components_t* c, const bsd_load
         if (gpu_free == 0) {
             available = cpu_free;
             where     = "CPU";
-        } else if (uses_host) {
+        } else if (uses_host && !kUnifiedMemory) {
+            // On unified memory the CPU and the GPU share one pool, so adding both would count it twice.
             available += cpu_free;
             where += " + CPU";
         }

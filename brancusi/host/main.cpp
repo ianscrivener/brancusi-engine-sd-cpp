@@ -638,8 +638,31 @@ void do_generate(const std::string& id, const json& cmd) {
 void do_convert(const std::string& id, const json& cmd) {
     set_current(id, "");
     g.stats = JobStats{};
-    const std::string input = str_or(cmd, "input"), output = str_or(cmd, "output"), type = str_or(cmd, "type"),
-                      rules = str_or(cmd, "rules");
+    const std::string input = str_or(cmd, "input"), output = str_or(cmd, "output"), type = str_or(cmd, "type");
+    std::string rules;
+    if (cmd.contains("rules") && !cmd["rules"].is_null()) {
+        const json& r = cmd["rules"];
+        bool ok       = r.is_string() || r.is_array();
+        if (r.is_string()) {
+            rules = r.get<std::string>();
+        } else if (r.is_array()) {
+            for (const auto& item : r) {
+                if (!item.is_string()) {
+                    ok = false;
+                    break;
+                }
+                if (!rules.empty()) {
+                    rules += ",";
+                }
+                rules += item.get<std::string>();
+            }
+        }
+        if (!ok) {
+            g.writer->send(error_message(id, BSD_ERR_INVALID_ARGUMENT, "rules must be a string or a list of strings."));
+            set_current("", "");
+            return;
+        }
+    }
     const int32_t convert_name = cmd.value("convert_name", false) ? 1 : 0;
     // Either one `input` file, or `components` (part name to path) to merge into one file.
     const bool has_parts = cmd.contains("components");
