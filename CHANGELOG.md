@@ -107,3 +107,8 @@ Two CodeRabbit fixes. Each step lists the file, the cause, the change and the te
 **Step 12. Commands in `capabilities`** ([main.cpp](brancusi/host/main.cpp))
 - Change: `capabilities` now also has `convert`, `inspect`, `schedulers` and `hardware`.
 - Test: `hello` and `info` list the four commands. `bsd-tests` passes.
+
+---
+20:44 Monday 2 November 2026
+
+**Version 0.1.2.** Release build.
