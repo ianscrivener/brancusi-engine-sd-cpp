@@ -87,3 +87,10 @@ Two CodeRabbit fixes. Each step lists the file, the cause, the change and the te
 - Cause: the per-part loop ran `ModelLoader::init_from_file()` on the tokenizer file. A `tokenizer.json` file is not a model file, so `inspect` could return `BSD_ERR_BAD_MODEL` for a part set that loads.
 - Change: the loop skips `BSD_COMPONENT_TOKENIZER`.
 - Test: `inspect` of Z-Image Turbo with a `tokenizer.json` part returns family "Z-Image".
+---
+19:20 Monday 2 November 2026
+
+**Step 10. CI action versions** ([brancusi-engine.yml](.github/workflows/brancusi-engine.yml))
+- Cause: `actions/checkout@v4` and `actions/upload-artifact@v4` target Node.js 20, which GitHub deprecates. Each CI run showed a warning.
+- Change: `checkout` v7, `upload-artifact` v7, `download-artifact` v8. These are the latest major versions. I did not change `Jimver/cuda-toolkit`, because only the CUDA variant uses it and that variant is off.
+- Test: see the CI run for the commit that holds this entry.

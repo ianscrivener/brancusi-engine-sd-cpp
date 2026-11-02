@@ -45,7 +45,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
@@ -95,7 +95,7 @@ jobs:
       - name: Package
         run: mkdir -p dist && brancusi/scripts/package.sh ${{ matrix.variant }} build dist | tee dist/${{ matrix.variant }}.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.variant }}
           path: dist/*
@@ -105,7 +105,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
