@@ -24,7 +24,7 @@ target_link_libraries(bsd PUBLIC stable-diffusion)
 target_compile_features(bsd PUBLIC cxx_std_17)
 
 # Engine release version. Every push bumps the patch number. Release tags are "brancusi-v<version>".
-set(BRANCUSI_VERSION 0.1.3)
+set(BRANCUSI_VERSION 0.1.4)
 # This fork starts from this upstream stable-diffusion.cpp commit. Update it after each upstream merge
 # (git merge-base HEAD upstream/master).
 set(BRANCUSI_SD_BASE 37bc88b)

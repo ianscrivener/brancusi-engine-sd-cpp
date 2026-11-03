@@ -147,3 +147,8 @@ Two CodeRabbit fixes. Each step lists the file, the cause, the change and the te
 - Cause: `bsd_detect_stage` read the stage from log text. The times had a resolution of 10 ms and depended on the log format.
 - Change: Layer 2. `BRANCUSI:` hooks in `generate_image()` mark `encode_prompt`, `sample` and `decode` on the steady clock. `stage` has `start_us`. `metrics` has `span` (`start_us`, `end_us`, `ms`). `done` has `stages`. `bsd_detect_stage` stays for the `load` stage and as the fallback. `hello` lists `stage_timing`.
 - Test: `bsd-tests` checks the order, the times and the close on early exit. Each stage of a real job has a span.
+
+---
+21:46 Tuesday 3 November 2026
+
+**Version 0.1.4.** Release build.
