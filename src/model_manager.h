@@ -15,6 +15,8 @@
 #include "model_loader.h"
 
 class ModelManager : public DeviceResidencyManager {
+    friend struct BsdPartProbe;  // BRANCUSI: Layer 2 part memory (brancusi/src/l2_parts.cpp).
+
 public:
     enum class ResidencyMode {
         Disk,

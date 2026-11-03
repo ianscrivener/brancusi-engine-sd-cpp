@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,7 @@
 #include <system_error>
 #include <vector>
 
+#include "bsd_hook.h"
 #include "ggml-backend.h"
 #include "l2.h"
 #include "stable-diffusion.h"
@@ -40,6 +42,9 @@ struct bsd_engine {
 
     std::atomic<bool> generating{false};
     std::atomic<bool> cancel_requested{false};
+
+    // Start time of the stages that Layer 2 hooks mark (see hook_stage_index()).
+    int64_t hook_start_us[3] = {0, 0, 0};
 };
 
 namespace {
@@ -73,6 +78,20 @@ bsd_engine* g_engine = nullptr;
 
 bool is_set(const char* s) {
     return s != nullptr && s[0] != '\0';
+}
+
+// The stages that the Layer 2 hooks in upstream generate_image() mark. -1 for any other name.
+int hook_stage_index(const char* name) {
+    if (name == nullptr) return -1;
+    if (std::strcmp(name, "encode_prompt") == 0) return 0;
+    if (std::strcmp(name, "sample") == 0) return 1;
+    if (std::strcmp(name, "decode") == 0) return 2;
+    return -1;
+}
+
+// One monotonic clock for all stage times, in microseconds.
+int64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 void emit(bsd_engine* e, const bsd_event_t& ev) {
@@ -117,6 +136,36 @@ void clear_recent_log(bsd_engine* e) {
     e->recent_log.clear();
 }
 
+// Called from the BRANCUSI hooks in upstream generate_image(), on the thread that runs the job.
+void on_stage_hook(const char* stage, int begin) {
+    bsd_engine* e   = g_engine;
+    const int index = hook_stage_index(stage);
+    if (e == nullptr || index < 0) {
+        return;
+    }
+    const int64_t now = now_us();
+    bsd_event_t ev    = make_event(BSD_EVENT_STAGE);
+    ev.stage          = stage;
+    if (begin) {
+        e->hook_start_us[index] = now;
+        ev.stage_phase          = BSD_STAGE_BEGIN;
+        ev.start_us             = now;
+        emit(e, ev);
+        return;
+    }
+    ev.stage_phase = BSD_STAGE_END;
+    ev.start_us    = e->hook_start_us[index];
+    ev.end_us      = now;
+    emit(e, ev);
+    bsd_event_t timing = make_event(BSD_EVENT_METRICS);
+    timing.timing_name = stage;
+    timing.timing_ms   = static_cast<float>(static_cast<double>(now - e->hook_start_us[index]) / 1000.0);
+    timing.stage_phase = BSD_STAGE_END;
+    timing.start_us    = e->hook_start_us[index];
+    timing.end_us      = now;
+    emit(e, timing);
+}
+
 void on_sd_log(sd_log_level_t level, const char* text, void*) {
     bsd_engine* e = g_engine;
     if (e == nullptr || text == nullptr) {
@@ -140,6 +189,9 @@ void on_sd_log(sd_log_level_t level, const char* text, void*) {
     const char* timing_name = nullptr;
     float timing_ms         = 0;
     if (bsd_detect_stage(line.c_str(), &stage, &timing_name, &timing_ms)) {
+        // The hooks give these stages with exact times, so the log text adds nothing.
+        if (hook_stage_index(stage) >= 0 && bsd_stage_hook() != nullptr) stage = nullptr;
+        if (hook_stage_index(timing_name) >= 0 && bsd_stage_hook() != nullptr) timing_name = nullptr;
         if (stage != nullptr) {
             emit_stage(e, stage);
         }
@@ -493,6 +545,7 @@ bsd_engine_t* bsd_create(const bsd_config_t* config) {
     g_engine     = e;
     sd_set_log_callback(on_sd_log, nullptr);
     sd_set_progress_callback(on_sd_progress, nullptr);
+    bsd_stage_hook() = on_stage_hook;
     return e;
 }
 
@@ -505,6 +558,7 @@ void bsd_destroy(bsd_engine_t* e) {
     }
     sd_set_log_callback(nullptr, nullptr);
     sd_set_progress_callback(nullptr, nullptr);
+    bsd_stage_hook() = nullptr;
     if (g_engine == e) {
         g_engine = nullptr;
     }
@@ -558,7 +612,8 @@ bsd_status_t bsd_info(bsd_engine_t* e, bsd_info_t* out) {
     out->sd_version   = sd_version();
     out->sd_commit    = sd_commit();
     out->system_info  = sd_get_system_info();
-    out->capabilities = BSD_CAP_CANCEL | BSD_CAP_MEMORY | BSD_CAP_AUTO_FIT;
+    out->capabilities = BSD_CAP_CANCEL | BSD_CAP_MEMORY | BSD_CAP_AUTO_FIT | BSD_CAP_SET_COMPONENT |
+                        BSD_CAP_PART_MEMORY | BSD_CAP_STAGE_TIMING;
     out->loaded       = e->ctx != nullptr ? 1 : 0;
     out->physical_cores = sd_get_num_physical_cores();
     out->n_threads      = e->n_threads;
@@ -592,6 +647,60 @@ bsd_status_t bsd_unload(bsd_engine_t* e) {
     }
     e->params_backend.clear();
     return BSD_OK;
+}
+
+bsd_status_t bsd_set_component(bsd_engine_t* e, bsd_component_t c, const char* path) {
+    if (e == nullptr) {
+        return BSD_ERR_INVALID_ARGUMENT;
+    }
+    if (e->generating) {
+        return fail(e, BSD_ERR_BUSY, "A job is running. Cancel it before you change a part.");
+    }
+    if (e->ctx == nullptr) {
+        return fail(e, BSD_ERR_NOT_LOADED, "The engine has no model. Load a model first.");
+    }
+    if (c != BSD_COMPONENT_VAE && c != BSD_COMPONENT_TAESD) {
+        return fail(e, BSD_ERR_UNSUPPORTED,
+                    std::string("The part '") + bsd_component_name(c) +
+                        "' cannot change on a loaded model. Only vae and taesd can. Load the model again.");
+    }
+    std::string file;
+    if (is_set(path)) {
+        file = path;
+        std::error_code ec;
+        if (!fs::is_regular_file(fs::u8path(file), ec)) {
+            return fail(e, BSD_ERR_MISSING_FILE,
+                        std::string("Model file not found for part '") + bsd_component_name(c) + "': " + file);
+        }
+    }
+    clear_recent_log(e);
+    emit_stage(e, "load");
+    bool lost = false;
+    std::string error;
+    const bsd_status_t st = bsd_l2::set_component(e->ctx, c, file, lost, error);
+    if (lost) {
+        free_sd_ctx(e->ctx);
+        e->ctx = nullptr;
+        e->params_backend.clear();
+    }
+    if (st != BSD_OK) {
+        return fail(e, st, error, recent_log_text(e));
+    }
+    return BSD_OK;
+}
+
+bsd_status_t bsd_parts(bsd_engine_t* e, bsd_parts_t* out) {
+    if (e == nullptr || out == nullptr) {
+        return BSD_ERR_INVALID_ARGUMENT;
+    }
+    *out      = bsd_parts_t{};
+    out->size = sizeof(*out);
+    if (e->ctx == nullptr) {
+        return fail(e, BSD_ERR_NOT_LOADED, "The engine has no model. Load a model first.");
+    }
+    std::string error;
+    const bsd_status_t st = bsd_l2::parts(e->ctx, out, error);
+    return st == BSD_OK ? st : fail(e, st, error);
 }
 
 uint64_t bsd_load_bytes(const bsd_components_t* c, const char* params_backend) {

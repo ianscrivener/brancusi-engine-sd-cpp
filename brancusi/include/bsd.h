@@ -99,6 +99,8 @@ typedef enum {
 #define BSD_CAP_SET_COMPONENT (1ull << 6) /* Layer 2 */
 #define BSD_CAP_RUN_STAGE     (1ull << 7) /* Layer 2 */
 #define BSD_CAP_AUTO_FIT      (1ull << 8) /* bsd_load_options_t.auto_fit */
+#define BSD_CAP_PART_MEMORY   (1ull << 9) /* Layer 2: bsd_parts() */
+#define BSD_CAP_STAGE_TIMING  (1ull << 10) /* Layer 2: exact stage events (start_us, end_us) */
 
 /* Values of bsd_load_options_t.auto_fit. */
 typedef enum {
@@ -183,7 +185,17 @@ typedef struct {
     /* BSD_EVENT_METRICS: a finished stage and its duration. */
     const char* timing_name;
     float timing_ms;
+    /* Added after the first release. BSD_EVENT_STAGE and BSD_EVENT_METRICS from Layer 2 hooks:
+     * the start and the end of a stage on one monotonic clock, in microseconds. For a stage that
+     * starts, stage_phase is BSD_STAGE_BEGIN and end_us is 0. For a stage that ends, it is
+     * BSD_STAGE_END. A stage from the log text (Layer 1) has stage_phase 0 and no times. */
+    int32_t stage_phase;
+    int64_t start_us;
+    int64_t end_us;
 } bsd_event_t;
+
+#define BSD_STAGE_BEGIN 1
+#define BSD_STAGE_END   2
 
 typedef void (*bsd_event_cb_t)(const bsd_event_t* event, void* user);
 
@@ -220,6 +232,24 @@ typedef struct {
     /* Params backend of the loaded model: as given, or as auto-fit set it. NULL when not set. */
     const char* params_backend;
 } bsd_info_t;
+
+#define BSD_MAX_PARTS 16
+
+/* Weight memory of one loaded part. */
+typedef struct {
+    char name[32];        /* "te", "diffusion", "vae", "taesd", "control_net" and others. */
+    char backend[32];     /* Params backend: a device name, or "disk". */
+    uint64_t bytes;       /* All weights of the part. */
+    uint64_t bytes_gpu;   /* In device memory now (also a staged copy for the compute backend). */
+    uint64_t bytes_cpu;   /* In host memory now. */
+    uint64_t on_disk;     /* Not in memory now: loads from the file when needed. */
+} bsd_part_memory_t;
+
+typedef struct {
+    uint32_t size;
+    int32_t count;
+    bsd_part_memory_t parts[BSD_MAX_PARTS];
+} bsd_parts_t;
 
 /* Name tables of the engine. See bsd_table_name(). */
 typedef enum {
@@ -306,6 +336,23 @@ bsd_status_t bsd_inspect(bsd_engine_t* e, const bsd_components_t* parts, const c
 bsd_status_t bsd_convert(bsd_engine_t* e, const char* input, const char* output, const char* type,
                          const char* rules, int32_t convert_name);
 
+/*
+ * Layer 2. Load, replace or remove one model part on the loaded model, without a model reload.
+ * `path` loads or replaces the part. NULL or "" removes it. Now only BSD_COMPONENT_VAE and
+ * BSD_COMPONENT_TAESD work. Other parts return BSD_ERR_UNSUPPORTED: the text encoder and the
+ * diffusion model share one upstream runner group, so a change rebuilds both. Returns
+ * BSD_ERR_NOT_LOADED without a model and BSD_ERR_BUSY while a job runs. If the new part does not
+ * fit the model, it returns BSD_ERR_BAD_MODEL and the old part stays. If upstream also cannot
+ * rebuild the old part, it returns BSD_ERR_INTERNAL and unloads the model.
+ */
+bsd_status_t bsd_set_component(bsd_engine_t* e, bsd_component_t c, const char* path);
+
+/*
+ * Layer 2. Weight memory of each part of the loaded model. Returns BSD_ERR_NOT_LOADED without a
+ * model and BSD_ERR_BUSY while a job runs (the job changes the part state).
+ */
+bsd_status_t bsd_parts(bsd_engine_t* e, bsd_parts_t* out);
+
 /* Work */
 bsd_status_t bsd_generate_image(bsd_engine_t* e, const bsd_image_params_t* p, bsd_result_t** out);
 void bsd_cancel(bsd_engine_t* e, bsd_cancel_mode_t mode);
@@ -344,7 +391,8 @@ bsd_status_t bsd_classify_failure(const char* log_text);
 /*
  * Layer 1 stage detection from one upstream log line. Sets *stage when a stage starts.
  * Sets *timing_name and *timing_ms when a stage ends. Returns 1 if the line matched.
- * Layer 2 replaces this with direct state (see the Layer 2 register).
+ * Layer 2 replaces this for encode_prompt, sample and decode with hooks that give exact times
+ * (see the Layer 2 register). This function stays as the fallback and for the load stage.
  */
 int bsd_detect_stage(const char* line, const char** stage, const char** timing_name, float* timing_ms);
 

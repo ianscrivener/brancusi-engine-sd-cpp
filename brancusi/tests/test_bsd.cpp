@@ -1,13 +1,17 @@
 // Unit tests for bsd_* functions that need no model.
 // Set BSD_TEST_SD15 to a single-file SD 1.5 model to also test inspect on a real file.
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <vector>
 
 #include "bsd.h"
+#include "bsd_hook.h"
 
 namespace fs = std::filesystem;
 
@@ -84,6 +88,59 @@ static void test_tables() {
     CHECK(bsd_table_name(BSD_TABLE_SCHEDULER, bsd_table_size(BSD_TABLE_SCHEDULER)) == nullptr);
 }
 
+struct SeenEvent {
+    bsd_event_type_t type;
+    std::string name;
+    int32_t phase;
+    int64_t start_us, end_us;
+    float timing_ms;
+};
+
+static void collect_event(const bsd_event_t* ev, void* user) {
+    if (ev->type != BSD_EVENT_STAGE && ev->type != BSD_EVENT_METRICS) return;
+    const char* name = ev->type == BSD_EVENT_STAGE ? ev->stage : ev->timing_name;
+    static_cast<std::vector<SeenEvent>*>(user)->push_back(
+        {ev->type, name != nullptr ? name : "", ev->stage_phase, ev->start_us, ev->end_us, ev->timing_ms});
+}
+
+static void test_stage_hooks(bsd_engine_t* e) {
+    std::vector<SeenEvent> seen;
+    bsd_set_event_cb(e, collect_event, &seen);
+    {
+        bsd_stage_scope scope("sample");
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        scope.end();
+        scope.end();  // A second end does nothing.
+    }
+    {
+        bsd_stage_scope scope("decode");  // The destructor closes the stage.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    bsd_set_event_cb(e, nullptr, nullptr);
+    // sample: begin, end, metrics. decode: begin, end, metrics.
+    CHECK(seen.size() == 6);
+    if (seen.size() == 6) {
+        CHECK(seen[0].type == BSD_EVENT_STAGE && seen[0].name == "sample" && seen[0].phase == BSD_STAGE_BEGIN);
+        CHECK(seen[0].start_us > 0 && seen[0].end_us == 0);
+        CHECK(seen[1].type == BSD_EVENT_STAGE && seen[1].phase == BSD_STAGE_END);
+        CHECK(seen[1].start_us == seen[0].start_us && seen[1].end_us - seen[1].start_us >= 20000);
+        CHECK(seen[2].type == BSD_EVENT_METRICS && seen[2].name == "sample" && seen[2].phase == BSD_STAGE_END);
+        CHECK(seen[2].timing_ms >= 20.0f && seen[2].timing_ms < 200.0f);
+        CHECK(static_cast<int64_t>(seen[2].timing_ms * 1000.0f) <= (seen[2].end_us - seen[2].start_us) + 1000);
+        CHECK(seen[3].name == "decode" && seen[3].start_us >= seen[1].end_us);
+        CHECK(seen[4].phase == BSD_STAGE_END && seen[5].name == "decode");
+    }
+    {
+        // An unknown stage name gives no event.
+        std::vector<SeenEvent> none;
+        bsd_set_event_cb(e, collect_event, &none);
+        bsd_stage_scope scope("load");
+        scope.end();
+        bsd_set_event_cb(e, nullptr, nullptr);
+        CHECK(none.empty());
+    }
+}
+
 static void test_load_errors() {
     bsd_config_t config{};
     config.size     = sizeof(config);
@@ -146,6 +203,15 @@ static void test_load_errors() {
         std::printf("bsd-tests: inspect on %s passed\n", sd15);
     }
 
+    // Layer 2: parts and set_component need a loaded model.
+    CHECK(bsd_set_component(e, BSD_COMPONENT_VAE, "/m/vae.safetensors") == BSD_ERR_NOT_LOADED);
+    CHECK(bsd_set_component(e, BSD_COMPONENT_VAE, nullptr) == BSD_ERR_NOT_LOADED);
+    CHECK(bsd_set_component(nullptr, BSD_COMPONENT_VAE, nullptr) == BSD_ERR_INVALID_ARGUMENT);
+    bsd_parts_t parts_out{};
+    CHECK(bsd_parts(e, &parts_out) == BSD_ERR_NOT_LOADED);
+    CHECK(bsd_parts(e, nullptr) == BSD_ERR_INVALID_ARGUMENT);
+    test_stage_hooks(e);
+
     bsd_info_t info{};
     CHECK(bsd_info(e, &info) == BSD_OK);
     CHECK(info.api_version == BSD_API_VERSION);
@@ -153,6 +219,9 @@ static void test_load_errors() {
     CHECK(info.physical_cores > 0);
     CHECK(info.n_threads > 0);
     CHECK(info.default_sample_method == nullptr);
+    CHECK((info.capabilities & BSD_CAP_SET_COMPONENT) != 0);
+    CHECK((info.capabilities & BSD_CAP_PART_MEMORY) != 0);
+    CHECK((info.capabilities & BSD_CAP_STAGE_TIMING) != 0);
 
     bsd_destroy(e);
 }

@@ -115,6 +115,12 @@ public:
         thread_.join();
     }
 
+    // True when no work runs or waits. Only the thread that posts work can rely on it.
+    bool idle() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !busy_ && !task_;
+    }
+
     // Returns false if work is already running or waiting.
     bool try_post(std::function<void()> task) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -159,6 +165,7 @@ struct JobStats {
     Clock::time_point last_preview{};
     Clock::time_point last_memory{};
     json timings = json::object();
+    json stages  = json::array();  // Stages with exact times from Layer 2 hooks.
     uint64_t min_free_bytes = UINT64_MAX;
     uint64_t total_bytes    = 0;
 };
@@ -237,10 +244,28 @@ json capabilities_json(uint64_t caps) {
         {BSD_CAP_IMAGE, "image"},     {BSD_CAP_VIDEO, "video"},           {BSD_CAP_CANCEL, "cancel"},
         {BSD_CAP_PREVIEW, "preview"}, {BSD_CAP_MEMORY, "memory"},         {BSD_CAP_UPSCALE, "upscale"},
         {BSD_CAP_SET_COMPONENT, "set_component"}, {BSD_CAP_RUN_STAGE, "run_stage"},
-        {BSD_CAP_AUTO_FIT, "auto_fit"},
+        {BSD_CAP_AUTO_FIT, "auto_fit"}, {BSD_CAP_PART_MEMORY, "part_memory"}, {BSD_CAP_STAGE_TIMING, "stage_timing"},
     };
     for (const auto& [flag, name] : names) {
         if (caps & flag) out.push_back(name);
+    }
+    return out;
+}
+
+// Weight memory of each part of the loaded model. Null if no model is loaded or a job runs.
+json parts_json() {
+    bsd_parts_t parts{};
+    parts.size = sizeof(parts);
+    if (bsd_parts(g.engine, &parts) != BSD_OK) return nullptr;
+    json out = json::array();
+    for (int i = 0; i < parts.count; i++) {
+        const bsd_part_memory_t& p = parts.parts[i];
+        out.push_back({{"name", p.name},
+                       {"backend", p.backend},
+                       {"bytes", p.bytes},
+                       {"bytes_gpu", p.bytes_gpu},
+                       {"bytes_cpu", p.bytes_cpu},
+                       {"on_disk", p.on_disk}});
     }
     return out;
 }
@@ -474,17 +499,31 @@ void on_event(const bsd_event_t* ev, void*) {
                                    {"sec_per_step", ev->sec_per_step}}));
             send_memory(false);
             return;
-        case BSD_EVENT_STAGE:
-            g.writer->send(tagged({{"event", "stage"}, {"stage", ev->stage}}));
+        case BSD_EVENT_STAGE: {
+            // A stage end from a Layer 2 hook comes again in the metrics event with the times.
+            if (ev->stage_phase == BSD_STAGE_END) return;
+            json m = {{"event", "stage"}, {"stage", ev->stage}};
+            if (ev->stage_phase == BSD_STAGE_BEGIN) m["start_us"] = ev->start_us;
+            g.writer->send(tagged(m));
             send_memory(true);
             return;
+        }
         case BSD_EVENT_METRICS: {
             if (ev->timing_name == nullptr) return;
             // Loading can happen more than once in a job (lazy load). Add the times.
             const std::string key = std::string(ev->timing_name) + "_ms";
             const double prev     = g.stats.timings.value(key, 0.0);
             g.stats.timings[key]  = std::round(prev + ev->timing_ms);
-            g.writer->send(tagged({{"event", "metrics"}, {"timings", {{key, std::round(ev->timing_ms)}}}}));
+            json m                = {{"event", "metrics"}, {"timings", {{key, std::round(ev->timing_ms)}}}};
+            if (ev->stage_phase == BSD_STAGE_END) {
+                const json span = {{"stage", ev->timing_name},
+                                   {"start_us", ev->start_us},
+                                   {"end_us", ev->end_us},
+                                   {"ms", static_cast<double>(ev->end_us - ev->start_us) / 1000.0}};
+                g.stats.stages.push_back(span);
+                m["span"] = span;
+            }
+            g.writer->send(tagged(m));
             return;
         }
         case BSD_EVENT_PREVIEW: {
@@ -639,6 +678,40 @@ void do_load(const std::string& id, const json& cmd) {
         m["id"]    = id;
         m["event"] = "loaded";
         m["ms"]    = ms_since(start);
+        if (json parts = parts_json(); !parts.is_null()) m["parts"] = parts;
+        g.writer->send(m);
+    }
+    set_current("", "");
+}
+
+// Layer 2: load, replace or remove one part of the loaded model. The reply is `loaded`.
+void do_set_component(const std::string& id, const json& cmd) {
+    set_current(id, "");
+    const std::string name = str_or(cmd, "component");
+    int index              = -1;
+    for (int i = 0; i < BSD_COMPONENT_COUNT; i++) {
+        if (name == bsd_component_name(static_cast<bsd_component_t>(i))) index = i;
+    }
+    const bool has_path = cmd.contains("path") && !cmd["path"].is_null();
+    if (index < 0 || (has_path && !cmd["path"].is_string())) {
+        g.writer->send(error_message(id, BSD_ERR_INVALID_ARGUMENT,
+                                     index < 0 ? "Unknown model part: " + name : "path must be a string or null."));
+        set_current("", "");
+        return;
+    }
+    const std::string path = has_path ? cmd["path"].get<std::string>() : "";
+    const auto start       = std::chrono::steady_clock::now();
+    const bsd_status_t st  = bsd_set_component(g.engine, static_cast<bsd_component_t>(index), c_or_null(path));
+    if (st != BSD_OK) {
+        g.writer->send(engine_error(id, st));
+    } else {
+        json m         = info_json();
+        m["id"]        = id;
+        m["event"]     = "loaded";
+        m["ms"]        = ms_since(start);
+        m["component"] = name;
+        m["path"]      = has_path ? json(path) : json(nullptr);
+        if (json parts = parts_json(); !parts.is_null()) m["parts"] = parts;
         g.writer->send(m);
     }
     set_current("", "");
@@ -709,6 +782,8 @@ void do_generate(const std::string& id, const json& cmd) {
     json timings        = g.stats.timings;
     timings["total_ms"] = ms_since(start);
     json done = {{"id", id}, {"event", "done"}, {"job", job}, {"outputs", outputs}, {"timings", timings}};
+    if (!g.stats.stages.empty()) done["stages"] = g.stats.stages;
+    if (json parts = parts_json(); !parts.is_null()) done["parts"] = parts;
     uint64_t peak = sampler.peak_bytes();
     if (g.stats.min_free_bytes != UINT64_MAX && g.stats.total_bytes > g.stats.min_free_bytes) {
         peak = std::max<uint64_t>(peak, g.stats.total_bytes - g.stats.min_free_bytes);
@@ -804,7 +879,12 @@ void handle(const std::string& line, Worker& worker) {
         m["event"] = "info";
         g.writer->send(m);
     } else if (name == "memory") {
-        g.writer->send({{"id", id}, {"event", "memory"}, {"devices", devices_json()}});
+        json m = {{"id", id}, {"event", "memory"}, {"devices", devices_json()}};
+        // Only this thread posts work, so an idle worker stays idle while the call runs.
+        if (worker.idle()) {
+            if (json parts = parts_json(); !parts.is_null()) m["parts"] = parts;
+        }
+        g.writer->send(m);
     } else if (name == "hardware") {
         json m    = hardware_json();
         m["id"]    = id;
@@ -826,7 +906,8 @@ void handle(const std::string& line, Worker& worker) {
             bsd_cancel(g.engine, str_or(cmd, "mode") == "new_latents" ? BSD_CANCEL_NEW_LATENTS : BSD_CANCEL_ALL);
         }
         g.writer->send({{"id", id}, {"event", "ok"}});
-    } else if (name == "load" || name == "unload" || name == "generate" || name == "convert" || name == "inspect") {
+    } else if (name == "load" || name == "unload" || name == "generate" || name == "convert" || name == "inspect" ||
+               name == "set_component") {
         std::function<void()> task;
         if (name == "inspect") {
             task = [id, cmd] { do_inspect(id, cmd); };
@@ -834,6 +915,8 @@ void handle(const std::string& line, Worker& worker) {
             task = [id, cmd] { do_convert(id, cmd); };
         } else if (name == "load") {
             task = [id, cmd] { do_load(id, cmd); };
+        } else if (name == "set_component") {
+            task = [id, cmd] { do_set_component(id, cmd); };
         } else if (name == "generate") {
             task = [id, cmd] { do_generate(id, cmd); };
         } else {

@@ -13,6 +13,8 @@
 #include "runtime/denoiser.hpp"
 #include "runtime/image_preprocess.h"
 #include "upscaler.h"
+// BRANCUSI: stage hooks (Layer 2).
+#include "../../brancusi/include/bsd_hook.h"
 
 namespace sd::pipeline {
 
@@ -605,6 +607,7 @@ namespace sd::pipeline {
             LOG_INFO("decoding %zu latents", final_latents.size());
         }
         std::vector<sd::Tensor<float>> decoded_images;
+        bsd_stage_scope decode_scope("decode");  // BRANCUSI: stage hook.
         int64_t t0     = ggml_time_ms();
         bool cancelled = false;
 
@@ -673,6 +676,7 @@ namespace sd::pipeline {
 
         int64_t t4 = ggml_time_ms();
         LOG_INFO("decode_first_stage completed, taking %.2fs", (t4 - t0) * 1.0f / 1000);
+        decode_scope.end();  // BRANCUSI: stage hook.
         if (decoded_images.empty() || cancelled) {
             LOG_ERROR(cancelled ? "cancelled before any latent images were decoded" : "no decoded images");
             return nullptr;
@@ -890,6 +894,7 @@ namespace sd::pipeline {
         }
         ImageGenerationLatents latents = std::move(*latents_opt);
 
+        bsd_stage_scope encode_scope("encode_prompt");  // BRANCUSI: stage hook.
         auto embeds_opt = prepare_image_generation_embeds(sd,
                                                           sd_img_gen_params,
                                                           &request,
@@ -899,8 +904,10 @@ namespace sd::pipeline {
         if (!embeds_opt.has_value()) {
             return false;
         }
+        encode_scope.end();  // BRANCUSI: stage hook.
         ImageGenerationEmbeds embeds = std::move(*embeds_opt);
         std::vector<sd::Tensor<float>> final_latents;
+        bsd_stage_scope sample_scope("sample");  // BRANCUSI: stage hook.
         int64_t denoise_start = ggml_time_ms();
         for (int b = 0; b < request.batch_count; b++) {
             sd_cancel_mode_t cancel = sd->get_cancel_flag();
@@ -962,6 +969,7 @@ namespace sd::pipeline {
             return false;
         }
         int64_t denoise_end = ggml_time_ms();
+        sample_scope.end();  // BRANCUSI: stage hook.
         LOG_INFO("generating %zu latent images completed, taking %.2fs",
                  final_latents.size(),
                  (denoise_end - denoise_start) * 1.0f / 1000);

@@ -8,6 +8,7 @@
 # definitions as the upstream library, so the internal structs have the same layout.
 add_library(bsd_l2 OBJECT
     src/l2_inspect.cpp
+    src/l2_parts.cpp
 )
 target_include_directories(bsd_l2 PRIVATE include $<TARGET_PROPERTY:stable-diffusion,INCLUDE_DIRECTORIES>)
 target_compile_definitions(bsd_l2 PRIVATE $<TARGET_PROPERTY:stable-diffusion,COMPILE_DEFINITIONS>)

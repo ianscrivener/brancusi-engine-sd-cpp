@@ -645,6 +645,11 @@ struct sd_ctx_t {
     StableDiffusionGGML* sd = nullptr;
 };
 
+// BRANCUSI: gives Layer 2 (brancusi/src/l2_parts.cpp) the context internals.
+SD_API StableDiffusionGGML* bsd_l2_context(sd_ctx_t* sd_ctx) {
+    return sd_ctx != nullptr ? sd_ctx->sd : nullptr;
+}
+
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
     if (sd_ctx == nullptr) {
