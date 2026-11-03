@@ -9,8 +9,9 @@ Pinned upstream release: `master-1028-37bc88b`.
 | Path | Contents |
 |---|---|
 | `include/bsd.h` | The `bsd_*` C API. Plain C ABI, versioned with `BSD_API_VERSION`. |
+| `include/bsd_hook.h` | The stage hook that upstream `generate_image()` calls (Layer 2). |
 | `src/l1_*.cpp` | Layer 1. Uses only `include/stable-diffusion.h` and the public ggml backend API. |
-| `src/l2.h`, `src/l2_*.cpp` | Layer 2. Uses upstream internals. Built as the `bsd_l2` object library with the upstream include folders and definitions. Now: `l2_inspect.cpp` (`ModelLoader`). |
+| `src/l2.h`, `src/l2_*.cpp` | Layer 2. Uses upstream internals. Built as the `bsd_l2` object library with the upstream include folders and definitions. Now: `l2_inspect.cpp` (`ModelLoader`) and `l2_parts.cpp` (parts of a live context). |
 | `host/main.cpp` | `brancusi-engine`. JSON lines on stdin and stdout. |
 | `tests/test_bsd.cpp` | Unit tests. They need no model. |
 | `scripts/package.sh` | Makes the zip for one variant. Prints its size and SHA-256. |
@@ -22,6 +23,9 @@ Each change to an upstream file has a `BRANCUSI:` comment.
 | File | Hook |
 |---|---|
 | `CMakeLists.txt` | `add_subdirectory(brancusi)` behind the `SD_BUILD_BRANCUSI` option (default `ON`). |
+| `src/pipeline/image.cpp` | `bsd_stage_scope` marks the start and the end of `encode_prompt`, `sample` and `decode`. |
+| `src/model_manager.h` | `friend struct BsdPartProbe`: gives `l2_parts.cpp` the tensor states for part memory. |
+| `src/stable-diffusion.cpp` | `bsd_l2_context()`: gives `l2_parts.cpp` the internals of `sd_ctx_t`. |
 
 ## Build (macOS, Metal)
 
@@ -50,13 +54,14 @@ Commands (core to engine):
 | `cmd` | Fields | Reply |
 |---|---|---|
 | `info` | – | `info` |
-| `memory` | – | `memory` with `devices` |
+| `memory` | – | `memory` with `devices`, and `parts` when a model is loaded and no command runs |
 | `load` | `components` (part name to path), `options` | `stage`, `log`, then `loaded` or `error` |
 | `unload` | – | `unloaded` or `error` |
 | `generate` | `job`, `params`, `output_dir`, `preview` | `stage`, `progress`, `preview`, `metrics`, `log`, then `done` or `error` |
 | `cancel` | `job`, `mode` (`all` or `new_latents`) | `ok`. The running job then ends with `error` code `cancelled`. |
 | `convert` | `input` or `components`, `output`, `type`, `rules` (optional), `convert_name` (optional) | `stage` (`convert`), `progress` (step = tensors written), `log`, then `ok` (`output`, `bytes`, `ms`) or `error` |
 | `inspect` | `components` (part name to path), `weight_type` (optional) | `log`, then `inspect` or `error` |
+| `set_component` | `component` (`vae` or `taesd`), `path` (a file, or `null` to remove the part) | `stage` (`load`), `log`, then `loaded` or `error` |
 | `hardware` | – | `hardware` |
 | `schedulers` | – | `schedulers` |
 | `log_level` | `level` (`debug`, `verbose`, `info`, `warn`, `error`) | `ok` |
@@ -76,6 +81,8 @@ Commands (core to engine):
 - `parts` has one entry for each given part. `type` is the type of most tensors.
 - `contents` tells what the files hold, from the tensor names: `diffusion`, `text_encoder` and `vae`. Use it to find missing parts.
 - `mem_bytes` is the upstream estimate of the weight memory, with `weight_type` if given.
+
+`set_component` (Layer 2) loads, replaces or removes the VAE or the TAESD on the loaded model, without a model reload. It uses the same upstream path as ControlNet (`apply_model_update`). The text encoder and the diffusion model weights stay in memory. The reply is a `loaded` event with the `info` fields, `ms`, `component`, `path` and `parts`. The command replies `busy` while a command runs, and `not_loaded` without a model. Other parts give `unsupported`: the text encoder and the diffusion model are one upstream runner group, so a change rebuilds both. If the new file does not fit the model, the reply is `bad_model` and the old part stays. Upstream then rebuilds the runners, so the next job loads the weights again. If upstream cannot rebuild the old part, the reply is `internal` and the engine unloads the model. Removing the VAE of a model that has no built-in VAE gives `bad_model`. The `hello` capability `set_component` tells that the engine has the command.
 
 `hardware` returns `system_info`, `features` (the `system_info` flags, for example `{"NEON":true}`), `physical_cores`, `n_threads` and `devices`. `schedulers` returns `samplers`, `schedulers` and `types` (weight type names) from the engine tables. Both commands run at once, also while a job runs.
 
@@ -97,11 +104,21 @@ The `loaded` reply has `params_backend`: the value that the load used, as given 
 
 Events during a job:
 
-- `stage`: `load`, `encode_prompt`, `sample` or `decode`. Layer 1 finds the stage in the upstream log text (`bsd_detect_stage`).
+- `stage`: `load`, `encode_prompt`, `sample` or `decode`. The stages `encode_prompt`, `sample` and `decode` come from hooks in upstream `generate_image()` (Layer 2) and have `start_us`: the start on the engine monotonic clock, in microseconds. Layer 1 finds the `load` stage in the upstream log text (`bsd_detect_stage`). The log text is the fallback when an engine has no hooks.
 - `progress`: `step`, `steps`, `sec_per_step`. Upstream also sends tensor loading as progress. Use it as a sampling step only in the `sample` stage.
-- `metrics`: device memory (`device`, `used_mib`, `free_mib`) at each stage change and at most once each second, or one stage duration (`timings`).
+- `metrics`: device memory (`device`, `used_mib`, `free_mib`) at each stage change and at most once each second, or one stage duration (`timings`). For a hooked stage, the duration event also has `span`: `stage`, `start_us`, `end_us` and `ms` (exact, from the same clock).
 - `loaded`: the `info` fields plus `ms`, `default_sample_method`, `default_scheduler`, `image_generation`, `video_generation` and `params_backend`. `capabilities` has `image` and `video` when the model supports them.
-- `done`: `outputs`, `timings` (`load_ms`, `encode_prompt_ms`, `sample_ms`, `decode_ms`, `total_ms`), `peak_bytes` and `peak_mib`.
+- `done`: `outputs`, `timings` (`load_ms`, `encode_prompt_ms`, `sample_ms`, `decode_ms`, `total_ms`), `stages` (the `span` of each hooked stage), `parts`, `peak_bytes` and `peak_mib`.
+
+`parts` (Layer 2) is the weight memory of each part. The `loaded` event, the `memory` reply and the `done` event can have it. A command that runs gives no `parts` in the `memory` reply, because the job changes the part state. Each entry:
+
+```json
+{"name":"diffusion","backend":"MTL0","bytes":5019095552,"bytes_gpu":5019095552,"bytes_cpu":0,"on_disk":0}
+```
+
+- `name`: `te`, `diffusion`, `vae`, `taesd` (the TAESD as the VAE, or for previews), `control_net` and others.
+- `backend`: the params backend of the part, or `disk`.
+- `bytes`: all weights of the part. `bytes_gpu` and `bytes_cpu` are the weights in device and host memory now. `bytes_gpu` also counts a staged copy for the compute backend. `on_disk` is the weights that are not in memory now. They load from the file when the part runs. After `load`, all bytes are `on_disk`, because upstream loads weights on first use.
 
 `peak_bytes` is the peak memory in use on the main device (the first GPU, or the CPU) during the job. It includes the weights that stay loaded. A thread reads the device memory (`ggml_backend_dev_memory`) each 50 ms while the job runs. On Metal, the value is the Metal memory of the engine process. The value cannot be more than the Metal working-set limit. `peak_mib` is the same value in MiB.
 

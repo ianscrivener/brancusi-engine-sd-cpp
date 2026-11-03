@@ -130,3 +130,20 @@ Two CodeRabbit fixes. Each step lists the file, the cause, the change and the te
 22:23 Monday 2 November 2026
 
 **Version 0.1.3.** Release build.
+
+---
+21:26 Tuesday 3 November 2026
+
+**Step 15. `set_component` for the VAE and the TAESD** ([l2_parts.cpp](brancusi/src/l2_parts.cpp), [bsd.h](brancusi/include/bsd.h), [main.cpp](brancusi/host/main.cpp))
+- Cause: a change of the VAE needed a full `load`. The app loaded all weights again.
+- Change: Layer 2. `bsd_set_component()` and the command `set_component` load, replace or remove the VAE or the TAESD on the loaded model. The code uses upstream `apply_model_update()` with the VAE runner group, as ControlNet does. If the new file does not fit, the old part stays. The text encoder and the diffusion model share one runner group, so they stay unsupported. `hello` lists `set_component`.
+- Test: Ernie Image Turbo Q4_K_M. A VAE swap takes 11 ms. The next job keeps the text encoder and the diffusion weights in memory (sampling 15.6 s, not 24.1 s). A mismatched VAE gives `bad_model` and the old VAE still makes images. `bsd-tests` passes.
+
+**Step 16. Memory of each part** ([l2_parts.cpp](brancusi/src/l2_parts.cpp), [main.cpp](brancusi/host/main.cpp))
+- Change: Layer 2. `bsd_parts()` reads the ModelManager tensor states (a `friend` hook). `loaded`, `memory` and `done` have `parts`: `name`, `backend`, `bytes`, `bytes_gpu`, `bytes_cpu` and `on_disk`. `hello` lists `part_memory`.
+- Test: after a job on Ernie Image Turbo, the text encoder, the diffusion model and the VAE report their bytes in `MTL0` memory.
+
+**Step 17. Stage events with exact times** ([image.cpp](src/pipeline/image.cpp), [bsd_hook.h](brancusi/include/bsd_hook.h), [l1_engine.cpp](brancusi/src/l1_engine.cpp), [main.cpp](brancusi/host/main.cpp))
+- Cause: `bsd_detect_stage` read the stage from log text. The times had a resolution of 10 ms and depended on the log format.
+- Change: Layer 2. `BRANCUSI:` hooks in `generate_image()` mark `encode_prompt`, `sample` and `decode` on the steady clock. `stage` has `start_us`. `metrics` has `span` (`start_us`, `end_us`, `ms`). `done` has `stages`. `bsd_detect_stage` stays for the `load` stage and as the fallback. `hello` lists `stage_timing`.
+- Test: `bsd-tests` checks the order, the times and the close on early exit. Each stage of a real job has a span.
